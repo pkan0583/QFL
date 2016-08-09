@@ -184,7 +184,7 @@ def main():
         #                                 key_name=ec2_key_name,
         #                                 security_group_ids=[security_group_name])
 
-        r = ec2.get_all_instances()[2]
+        r = ec2.get_all_instances()[0]
         instance = r.instances[0]
         instance.ip_address
 
@@ -195,17 +195,17 @@ def main():
         # instance = create_new_instance()
 
         # Set Env Host String
-        env.host_string = "root-user@%s" % (instance.ip_address)
+        env.host_string = "ubuntu@%s" % (instance.ip_address)
         env['key_filename'] = '~/.ssh/ec2-sample-key.pem'
-        env['user'] = 'root'
 
         # env['hosts'] = ['ec2-52-42-53-34.us-west-2.compute.amazonaws.com']
 
         env['password'] = 'Thirdgen1'
         env['localuser'] = 'benneifert'
         env['use_shell'] = False
-        env['sudo_user'] = 'root'
-        env['user'] = 'root'
+        env['sudo_user'] = 'ubuntu'
+        env['user'] = 'ubuntu'
+        env['abort_on_prompts'] = True
 
         env.prompts = {'Is this ok [y/d/N]': 'y',
                        'Is this ok [y/d/N]:': 'y',

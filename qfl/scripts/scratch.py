@@ -6,37 +6,444 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pyfolio
 import urllib
-import qfl.core.data_interfaces as data_interfaces
-from qfl.core.data_interfaces import DatabaseInterface as db
-import qfl.etl.data_ingest as etl
-import qfl.core.calcs as lib
 import pymc
 import requests
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter, A4
 import sqlalchemy as sa
 from sqlalchemy.sql.expression import Insert, Select, and_, or_, bindparam
+import statsmodels.tsa.stattools as sm
+import qfl.core.data_interfaces as qfl_data
+from qfl.core.data_interfaces import DatabaseInterface as db, QuandlApi
+import qfl.macro.macro_models as macro
+import qfl.etl.data_ingest as etl
+import qfl.core.calcs as lib
 import qfl.core.utils as utils
 from qfl.core.data_interfaces import YahooApi
+import qfl.utilities.BasicUtilities as bu
+from scipy import interpolate
+import matplotlib.ticker as mtick
+from matplotlib import cm
+import logging
+from pandas.tseries.offsets import BDay
+
+reload(etl)
+reload(qfl_data)
+from qfl.core.data_interfaces import DatabaseInterface as db, QuandlApi
+db.initialize()
+
+# etl.add_equities_from_index(ticker='NDX', country='US', _db=db)
+
+date = dt.datetime.today()
+source_series = 'EUREX_FVS'
+futures_series = 'FVS'
+dataset = 'CHRIS'
+_db = db
+contract_range = np.arange(0, 8)
+start_date = dt.datetime(2012, 1,1 )
+
+etl.load_historical_futures_prices(
+    _db=db,
+    dataset=dataset,
+    futures_series=futures_series,
+    start_date=dt.datetime(2012, 1, 1)
+)
+
+etl.load_historical_generic_futures_prices(
+    _db=db,
+    dataset=dataset,
+    contract_range=contract_range,
+    start_date=start_date,
+    futures_series=futures_series,
+    source_series=source_series
+)
 
 
+futures_data = QuandlApi.retrieve_historical_generic_futures_prices(
+    start_date=start_date,
+    futures_series=futures_series,
+    source_series=source_series,
+    contract_range=contract_range,
+    dataset=dataset)
+futures_data.index.names = ['ticker', 'date']
+futures_data = futures_data.reset_index()
+
+# Contracts
+futures_contracts_table = db.get_table(
+    table_name='generic_futures_contracts')
+contracts_retrieved = pd.DataFrame(futures_data.groupby('ticker')
+                                   .last()['contract_number'])
+futures_series_data = db.get_data(table_name='futures_series')
+ind = futures_series_data.index[
+    futures_series_data['series'] == futures_series]
+series_id = futures_series_data.loc[ind, 'id'].values[0]
+contracts_retrieved['series_id'] = series_id
+contracts_retrieved = contracts_retrieved.reset_index()
+
+_db.execute_db_save(df=contracts_retrieved,
+                    table=futures_contracts_table,
+                    use_column_as_key='ticker',
+                    extra_careful=False)
+
+# Prices
+futures_prices_table = _db.get_table(table_name='generic_futures_prices')
+futures_data['open_interest'] = \
+    futures_data['Prev. Day Open Interest'].shift(-1)
+rename_cols = {'Close': 'close_price',
+               'High': 'high_price',
+               'Low': 'low_price',
+               'Open': 'open_price',
+               'Settle': 'settle_price',
+               'Total Volume': 'volume'}
+futures_data = futures_data.rename(columns=rename_cols)
+
+# Filter for valid prices
+futures_data = futures_data[
+    futures_data['settle_price'] > 0]
+
+# Join with id
+futures_contracts = _db.get_data(table_name='generic_futures_contracts')
+
+tmp = pd.merge(left=futures_contracts[['id', 'ticker']],
+               right=futures_data,
+               on='ticker')
+
+for col in tmp.columns:
+    if col not in futures_prices_table.columns.keys():
+        del tmp[col]
+
+
+
+
+
+
+
+
+
+#############################################################################
+# Macro
+#############################################################################
+
+reload(macro)
+
+start_date = dt.datetime(1980, 1, 1)
+ffill_limit = 3
+diff_window = 1
+diff_threshold = 0.875
+
+macro_data, settings, raw_macro_data = macro.load_fundamental_data()
+
+macro_data, macro_data_1d, macro_data_3d, macro_data_6d, macro_data_ma = \
+    macro.process_factor_model_data(raw_macro_data=raw_macro_data,
+                                    macro_data=macro_data,
+                                    settings=settings)
+
+# AR1
+ar1_coefs = macro.compute_ar_coefs(macro_data=macro_data,
+                                   macro_data_1d=macro_data_1d,
+                                   macro_data_3d=macro_data_3d,
+                                   macro_data_6d=macro_data_6d,
+                                   macro_data_ma=macro_data_ma,
+                                   settings=settings)
+
+macro_data_stationary = macro.process_data_by_ar(macro_data=macro_data,
+                                                 ar1_coefs=ar1_coefs,
+                                                 ar1_threshold=diff_threshold,
+                                                 diff_window=diff_window)
+
+# Z-scores
+macro_data_z = ((macro_data_stationary - macro_data_stationary.mean())
+    / macro_data_stationary.std()).fillna(method='ffill', limit=ffill_limit)
+components, pca_factors, pca_obj = macro.compute_factors(
+    macro_data_z=macro_data_z,
+    settings=settings)
+components, pca_factors = macro.process_factors(
+    components=components,
+    pca_factors=pca_factors,
+    settings=settings)
+# MA Z-scores
+macro_data_maz = ((macro_data_ma - macro_data_ma.mean()) / macro_data_ma.std()
+                  ).fillna(method='ffill', limit=ffill_limit)
+components_ma, pca_factors_ma, pca_obj_ma = macro.compute_factors(
+    macro_data_z=macro_data_maz, settings=settings)
+components_ma, pca_factors_ma = macro.process_factors(
+    components=components_ma, pca_factors=pca_factors_ma, settings=settings)
+
+plot_start_date = dt.datetime(1980, 1, 1)
+plt.figure()
+plt.plot(pca_factors[pca_factors.index >= plot_start_date][0])
+plt.plot(pca_factors[0].rolling(window=3, center=False).mean())
+
+
+volatility_indicator='Volatility252'
+macro_indicator = pca_factors[0]
+
+capped_volatility, capped_volatility_lead, residual_volatility = \
+    macro.prepare_volatility_data(ticker='^GSPC',
+                                  start_date=start_date,
+                                  exclude87=True)
+
+f, f_res, out_grid, npd = macro.prepare_nonparametric_analysis(
+    capped_volatility_lead=capped_volatility_lead,
+    capped_volatility=capped_volatility,
+    residual_volatility=residual_volatility,
+    macro_indicator=macro_indicator,
+    start_date=start_date
+)
+
+
+##############################################################################
+# Plotting
+##############################################################################
+
+plot_start_date = dt.datetime(2010, 1, 1)
+plot_ind = npd.index[npd.index >= plot_start_date]
+plot_data = npd.loc[plot_ind, ['ZF1M', 'ZLF1']]
+text_color_scheme = 'red'
+background_color = 'black'
+
+f1, ax1 = plt.subplots(figsize=[10, 6])
+plt.plot(plot_data)
+ax1.set_title('US Macro Model',
+              fontsize=14,
+              fontweight='bold')
+ax1.title.set_color(text_color_scheme)
+ax1.spines['bottom'].set_color(text_color_scheme)
+ax1.spines['top'].set_color(text_color_scheme)
+ax1.xaxis.label.set_color(text_color_scheme)
+ax1.yaxis.label.set_color(text_color_scheme)
+ax1.set_ylabel('Z-Score')
+ax1.tick_params(axis='x', colors=text_color_scheme)
+ax1.tick_params(axis='y', colors=text_color_scheme)
+# ax1.yaxis.set_major_formatter(mtick.FormatStrFormatter('%.1f%%'))
+leg = ax1.legend(['Level', 'Moving Average'], loc=3)
+ax1.set_axis_bgcolor(background_color)
+leg.get_frame().set_facecolor('red')
+plt.savefig('figures/macro.png',
+            facecolor='k',
+            edgecolor='k',
+            transparent=True)
+
+##############################################################################
+# Plotting
+##############################################################################
+
+from mpl_toolkits.mplot3d import Axes3D
+
+currentDate = npd.index[len(npd.index)-1]
+currentLevel = npd['ZF1M'][currentDate]
+currentChange = npd['ZDF1'][currentDate]
+
+# Transparent colormap
+theCM = cm.get_cmap()
+theCM._init()
+alphas = np.abs(np.linspace(-2.0, 2.0, theCM.N))
+theCM._lut[:-3,-1] = alphas
+
+# Figure 1: nonparametric
+fig = plt.figure(figsize=(16,8))
+ax = fig.gca(projection='3d')
+scat = ax.scatter(currentLevel,
+                  currentChange,
+                  f(currentLevel, currentChange) * 100 + 2,
+                  c='r',
+                  s=200,
+                  zorder=10)
+surf = ax.plot_surface(outGrid[0], outGrid[1], predGrid * 100.0,
+                       rstride=1, cstride=1, cmap='coolwarm',
+                       linewidth=0, antialiased=False, zorder=0)
+ax.set_xlabel('F1')
+ax.set_ylabel('Change in F1')
+ax.set_zlabel('S&P realized volatility, next 1y')
+ax.set_title('Subsequent 1y S&P realized volatility,'
+             'versus Z-scores of level and change of US macro index')
+ax.set_xlim([changeGridMin, changeGridMax])
+ax.set_ylim([levelGridMin, levelGridMax])
+# ax.set_zlim([10, 60])
+fmt = '%.0f%%'
+zticks = mtick.FormatStrFormatter(fmt)
+ax.zaxis.set_major_formatter(zticks)
+fig.colorbar(surf, shrink=0.5, aspect=5)
+ax.set_axis_bgcolor('w')
+# ax.axis([-3, 3, -3, 3, 10, 40])
+ax.view_init(30, 30)
+plt.savefig('figures/macro_volatility.png',
+            facecolor='w',
+            edgecolor='w',
+            transparent=True)
+
+
+print('done!')
+
+
+# Prediction grid
+prediction_lag = 6
+macro_pred_grid = pd.DataFrame(index=settings.data_fields,
+                               columns=settings.data_fields)
+for f1 in settings.data_fields:
+    print('regressions for ' + f1)
+    for f2 in settings.data_fields:
+        tmp = pd.ols(y=macro_data_z[f1],
+                     x=macro_data_z[f2].shift(prediction_lag))
+        macro_pred_grid.loc[f1, f2] = tmp.beta[0]
+
+
+#############################################################################
 # AWS
+#############################################################################
+
+import ib
+from ib.opt import ibConnection
+tws = ibConnection( host = 'localhost',port= 7496, clientId = 123)
+tws.reqAccountUpdates(True,'accountnumber')
+
+#############################################################################
+# VIX futures
+#############################################################################
+
+reload(etl)
+reload(qfl_data)
+from qfl.core.data_interfaces import DatabaseInterface as db
+from qfl.core.data_interfaces import QuandlApi
+db.initialize()
+
+# etl.load_historical_generic_vix_futures_prices(_db=db)
+
+dataset = 'EUREX'
+futures_series = 'FVS'
+start_date = dt.datetime(2010, 1, 1)
+contract_range = np.arange(1, 9)
+_db = db
+
+data = qfl_data.QuandlApi.retrieve_historical_vstoxx_futures_prices(
+    start_date=start_date
+)
+
+etl.load_historical_futures_prices(
+    _db=db,
+    start_date=start_date,
+    futures_series=futures_series,
+    dataset=dataset
+)
+
+etl.load_historical_generic_futures_prices(
+    _db=db,
+    start_date=start_date,
+    futures_series='FVS',
+    source_series='EUREX_FVS',
+    contract_range=contract_range,
+    dataset='CHRIS'
+)
+
+# Get updated VIX futures data
+vix_data = qfl_data.QuandlApi.update_futures_prices(
+    date=dt.datetime.today(),
+    dataset='CBOE',
+    futures_series='VX',
+    contract_range=np.arange(0, 10)
+)
+
+v2x_data = qfl_data.QuandlApi.update_futures_prices(
+    date=dt.datetime.today(),
+    dataset='EUREX',
+    futures_series='FVS',
+    contract_range=np.arange(0, 10)
+)
+
+etl.update_futures_prices(_db=db,
+                          dataset='EUREX',
+                          futures_series='FVS',
+                          contract_range=np.arange(0,10))
+
+futures_data = v2x_data
+futures_series = 'FVS'
+_db = db
+
+futures_data['open_interest'] = \
+    futures_data['Prev. Day Open Interest']
+
+# Map to appropriate contact
+series_data = _db.get_futures_series(futures_series=futures_series)
+series_id = series_data['id'].values[0]
+
+where_str = " series_id = " + str(series_id) \
+            + " and maturity_date >= '" + dt.datetime.today().date().__str__() + "'"
+
+futures_contracts_data = _db.get_data(
+    table_name='futures_contracts',
+    where_str=where_str)
+
+futures_data = futures_data.reset_index()
+
+df = pd.merge(left=futures_contracts_data[['series_id', 'ticker']],
+              right=futures_data,
+              on='ticker')
+cols = ['series_id', 'date', 'close_price', 'high_price', 'low_price',
+        'open_price', 'settle_price', 'volume', 'open_interest']
+cols = list(set(cols).intersection(set(df.columns)))
+
+df = df[cols]
 
 
 
+
+import barchart
+barchart.API_KEY = '5c45079e0956acbcf33925204ee4846a'
+
+
+
+import urllib2
+import simplejson as json
+
+barchart_api = "getQuote"
+return_format = "json"
+req_url = "http://marketdata.websol.barchart.com/getQuote.json?key=5c45079e0956acbcf33925204ee4846a&symbols=VIQ16"
+
+
+response = urllib2.urlopen(req_url)
+results_dict = json.loads(response.read())
+if 'results' in results_dict:
+    results_list = results_dict['results']
+    df = pd.DataFrame(results_list)
+    df.index = [df['symbol'], df['tradeTimestamp']]
+    del df['symbol']
+    del df['tradeTimestamp']
+
+import requests_cache
+session = requests_cache.CachedSession(cache_name='cache',
+    backend='sqlite', expire_after=dt.timedelta(days=1))
+
+# getQuote with ONE symbol
+# ========================
+symbol = "^EURUSD"
+quote = barchart.getQuote(symbol,
+                          apikey=barchart.API_KEY,
+                          session=session)
+print(quote) # quote is a dict
+
+
+
+# note codes for VIX futures positioning
+# CFTC/TIFF_CBOE_VX_ALL
+
+#############################################################################
+# Database stuff
+#############################################################################
 
 
 reload(etl)
-reload(data_interfaces)
-import qfl.core.data_interfaces as data_interfaces
+reload(qfl_data)
 from qfl.core.data_interfaces import DatabaseInterface as db
 
 # Database stuff
 db.initialize()
 
+
+
+
 etl.daily_equity_price_ingest()
 
-date = utils.closest_business_day_in_past()
+date = utils.closest_business_day()
 data_source = 'yahoo'
 
 etl.load_historical_equity_prices(ids=None,
@@ -151,7 +558,7 @@ equity_tickers = equity_tickers[0:1]
 
 ids = db.get_equity_ids(equity_tickers)
 
-date = utils.closest_business_day_in_past()
+date = utils.closest_business_day()
 
 expiry_dates, links = pdata.YahooOptions('ABBV') \
     ._get_expiry_dates_and_links()

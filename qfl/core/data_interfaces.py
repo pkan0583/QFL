@@ -1,6 +1,8 @@
 import pandas as pd
 import datetime as dt
 import pandas_datareader.data as pdata
+from pandas.tseries.offsets import BDay
+import quandl as ql
 import numpy as np
 import sqlalchemy as sa
 import urllib
@@ -8,6 +10,13 @@ import dateutil
 from sqlalchemy.sql.expression import bindparam
 from bs4 import BeautifulSoup
 import requests
+import logging
+
+import urllib2
+import simplejson as json
+
+import qfl.core.constants as constants
+import qfl.core.utils as utils
 
 
 class DatabaseInterface(object):
@@ -67,6 +76,15 @@ class DatabaseInterface(object):
     def initialize(cls):
 
         # Database connection string
+        dbname = 'postgres'
+        username = 'postgres'
+        password = 'Thirdgen1'
+        dbtype = 'postgresql'
+        hostname = 'localhost'
+        port = '5422'
+
+        cls.connection_string = dbtype + "://" + username + ":" + password \
+                              + "@" + hostname + ":" + port + "/" + dbname
         cls.connection_string = "postgresql://postgres:Thirdgen1@localhost:5432/postgres"
         cls.engine = sa.create_engine(cls.connection_string, echo=False)
 
@@ -99,7 +117,9 @@ class DatabaseInterface(object):
         equities_table = sa.Table(
             'equities', cls.metadata,
             sa.Column('id', sa.Integer, primary_key=True, unique=True),
-            sa.Column('ticker', sa.String(64), primary_key=False, unique=True))
+            sa.Column('ticker', sa.String(64), unique=True, nullable=False),
+            sa.Column('country', sa.String(8), unique=False)
+        )
 
         cls.tables['equities'] = equities_table
 
@@ -107,7 +127,7 @@ class DatabaseInterface(object):
         equity_options_table = sa.Table(
             'equity_options', cls.metadata,
             sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('ticker', sa.String(64), primary_key=False, nullable=False, unique=True),
+            sa.Column('ticker', sa.String(64), nullable=False, unique=True),
             sa.Column('underlying_id', sa.Integer, primary_key=False),
             sa.Column('option_type', sa.String(16), primary_key=False),
             sa.Column('strike_price', sa.Float, primary_key=False),
@@ -164,7 +184,8 @@ class DatabaseInterface(object):
             'equity_indices',
             cls.metadata,
             sa.Column('index_id', sa.Integer, primary_key=True, unique=True),
-            sa.Column('ticker', sa.String(32), primary_key=False))
+            sa.Column('ticker', sa.String(32), primary_key=False),
+            sa.Column('country', sa.String(8), primary_key=False))
         cls.tables['equity_indices'] = equity_index_table
 
         # EQUITY INDEX MEMBERS
@@ -174,8 +195,90 @@ class DatabaseInterface(object):
             sa.Column('index_id', sa.Integer, primary_key=True),
             sa.Column('equity_id', sa.Integer, primary_key=True),
             sa.Column('valid_date', sa.Date, primary_key=True),
-            sa.ForeignKeyConstraint(['index_id'], ['equity_indices.index_id']))
+            sa.ForeignKeyConstraint(['index_id'], ['equity_indices.index_id']),
+            sa.ForeignKeyConstraint(['equity_id'], ['equities.id']))
         cls.tables['equity_index_members'] = equity_index_members_table
+
+        # FUTURES SERIES
+        futures_series_table = sa.Table(
+            'futures_series',
+            cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('series', sa.String(128), nullable=False),
+            sa.Column('description', sa.String(128), primary_key=False),
+            sa.Column('exchange', sa.String(128), primary_key=False),
+            sa.Column('currency', sa.String(16), nullable=False),
+            sa.Column('contract_size', sa.String(128), primary_key=False),
+            sa.Column('units', sa.String(128), primary_key=False),
+            sa.Column('point_value', sa.Float, primary_key=False),
+            sa.Column('tick_value', sa.Float, primary_key=False),
+            sa.Column('delivery_months', sa.String(16), primary_key=False)
+        )
+        cls.tables['futures_series'] = futures_series_table
+
+        # FUTURES CONTRACTS
+        futures_contracts_table = sa.Table(
+            'futures_contracts',
+            cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('series_id', sa.Integer, nullable=False),
+            sa.Column('ticker', sa.String(32), nullable=False),
+            sa.Column('maturity_date', sa.Date, nullable=False),
+            sa.ForeignKeyConstraint(['series_id'], ['futures_series.id'])
+        )
+        cls.tables['futures_contracts'] = futures_contracts_table
+
+        # FUTURES PRICES
+        futures_prices_table = sa.Table(
+            'futures_prices',
+            cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('last_price', sa.Float, primary_key=False),
+            sa.Column('bid_price', sa.Float, primary_key=False),
+            sa.Column('ask_price', sa.Float, primary_key=False),
+            sa.Column('settle_price', sa.Float, primary_key=False),
+            sa.Column('open_price', sa.Float, primary_key=False),
+            sa.Column('close_price', sa.Float, primary_key=False),
+            sa.Column('high_price', sa.Float, primary_key=False),
+            sa.Column('low_price', sa.Float, primary_key=False),
+            sa.Column('open_interest', sa.Integer, primary_key=False),
+            sa.Column('volume', sa.Integer, primary_key=False),
+            sa.ForeignKeyConstraint(['id'], ['futures_contracts.id'])
+        )
+        cls.tables['futures_prices'] = futures_prices_table
+
+        # GENERIC FUTURES CONTRACTS
+        generic_futures_contracts_table = sa.Table(
+            'generic_futures_contracts',
+            cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('series_id', sa.Integer, nullable=False),
+            sa.Column('ticker', sa.String(32), nullable=False),
+            sa.Column('contract_number', sa.Integer, nullable=False),
+            sa.ForeignKeyConstraint(['series_id'], ['futures_series.id'])
+        )
+        cls.tables['generic_futures_contracts'] = generic_futures_contracts_table
+
+        # GENERIC FUTURES PRICES
+        generic_futures_prices_table = sa.Table(
+            'generic_futures_prices',
+            cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('last_price', sa.Float, primary_key=False),
+            sa.Column('bid_price', sa.Float, primary_key=False),
+            sa.Column('ask_price', sa.Float, primary_key=False),
+            sa.Column('settle_price', sa.Float, primary_key=False),
+            sa.Column('open_price', sa.Float, primary_key=False),
+            sa.Column('close_price', sa.Float, primary_key=False),
+            sa.Column('high_price', sa.Float, primary_key=False),
+            sa.Column('low_price', sa.Float, primary_key=False),
+            sa.Column('open_interest', sa.Integer, primary_key=False),
+            sa.Column('volume', sa.Integer, primary_key=False),
+            sa.ForeignKeyConstraint(['id'], ['generic_futures_contracts.id'])
+        )
+        cls.tables['generic_futures_prices'] = generic_futures_prices_table
 
     @classmethod
     def create_tables(cls):
@@ -190,10 +293,19 @@ class DatabaseInterface(object):
                 return None
 
     @classmethod
-    def execute_bulk_insert(cls, df, table):
-        list_to_write = df.to_dict(orient='records')
-        result = cls.engine.execute(sa.insert(table=table,
-                                              values=list_to_write))
+    def execute_bulk_insert(cls, df=None, table=None, batch_size=1000):
+
+        num_batches = int(np.ceil(float(len(df)) / batch_size))
+        result = None
+        for i in range(0, num_batches):
+            urange = np.min([(i + 1) * batch_size, len(df)-1])
+            if urange == 0:
+                list_to_write = df.to_dict(orient='records')
+            else:
+                ind = np.arange(i * batch_size, urange)
+                list_to_write = df.iloc[ind].to_dict(orient='records')
+            result = cls.engine.execute(sa.insert(table=table,
+                                                  values=list_to_write))
         return result
 
     @classmethod
@@ -222,6 +334,33 @@ class DatabaseInterface(object):
         return out
 
     @classmethod
+    def build_pk_where_or_str(cls, df, table, use_column_as_key):
+        where_str = str()
+        if use_column_as_key is None:
+            key_column_names = table.primary_key.columns.keys()
+        else:
+            key_column_names = [use_column_as_key]
+        for i in range(0, len(df)):
+            if where_str != '':
+                where_str += ') or ('
+            else:
+                where_str += '('
+            for key in key_column_names:
+                if key in df:
+                    key_to_write = str(df.iloc[i][key])
+                    if isinstance(table.columns[key].type, sa.String):
+                        key_to_write = "'" + key_to_write + "'"
+                    if isinstance(table.columns[key].type, sa.Date):
+                        key_to_write = "'" + str(pd.to_datetime(key_to_write)) + "'"
+                    if key != key_column_names[0]:
+                        where_str += ' and '
+                    where_str += key + " = " + key_to_write
+        if where_str != '':
+            where_str += ')'
+
+        return where_str, key_column_names
+
+    @classmethod
     def build_pk_where_str(cls, df, table, use_column_as_key):
         where_str = str()
         if use_column_as_key is None:
@@ -231,9 +370,13 @@ class DatabaseInterface(object):
         for key in key_column_names:
             if key in df:
                 unique_keys = np.unique(df[key])
+                if len(unique_keys) == 1:
+                    t = '(' + str(unique_keys[0]) + ')'
+                else:
+                    t = tuple(unique_keys)
                 if isinstance(table.columns[key].type, sa.String):
                     unique_keys = [str(k) for k in unique_keys]
-                t = tuple(unique_keys)
+                    t = cls.parenthetical_string_list_with_quotes(unique_keys)
                 if isinstance(table.columns[key].type, sa.Date):
                     unique_keys = [str(k) for k in pd.to_datetime(unique_keys)]
                     t = cls.parenthetical_string_list_with_quotes(unique_keys)
@@ -250,7 +393,12 @@ class DatabaseInterface(object):
         return where_str, key_column_names
 
     @classmethod
-    def execute_db_save(cls, df, table, use_column_as_key=None):
+    def execute_db_save(cls,
+                        df=None,
+                        table=None,
+                        use_column_as_key=None,
+                        extra_careful=True,
+                        delete_existing=False):
 
         """
         This is a generic fast method to insert-if-exists-update a database
@@ -261,15 +409,26 @@ class DatabaseInterface(object):
         :return: none
         """
 
+        logging.info('starting archive of '
+                     + str(len(df)) + ' records')
+
         # Get where string to identify existing rows
-        where_str, key_column_names = cls.build_pk_where_str(df,
-                                                             table,
-                                                             use_column_as_key)
+        if extra_careful:
+            where_str, key_column_names = cls.build_pk_where_or_str(
+                df, table, use_column_as_key)
+        else:
+            where_str, key_column_names = cls.build_pk_where_str(
+                df, table, use_column_as_key)
 
         # Grab column names
         column_names = table.columns.keys()
         column_list = [table.columns[column_name]
                        for column_name in column_names]
+
+        # OK try this: DELETE the stuff that's already there
+        if delete_existing:
+            d = sa.delete(table, whereclause=where_str)
+            cls.conn.execute(d)
 
         # Grab the existing data in table corresponding to the new data
         s = sa.select(columns=column_list).where(where_str)
@@ -285,7 +444,8 @@ class DatabaseInterface(object):
         df_key_cols = [df[key_column] for key_column in key_column_names_in_df]
 
         if use_column_as_key is None:
-            df.index = df_key_cols
+            if len(key_column_names_in_df) > 0:
+                df.index = df_key_cols
         else:
             orig_key_cols = table.primary_key.columns.keys()
             df.index = df[use_column_as_key]
@@ -305,7 +465,7 @@ class DatabaseInterface(object):
 
         # Insert part is easy
         if len(insert_df) > 0:
-            insert_df.reset_index()
+            insert_df = insert_df.reset_index()
             cls.execute_bulk_insert(insert_df, table)
 
         # Generic version of update using bindparams
@@ -344,23 +504,60 @@ class DatabaseInterface(object):
             # Execute the update command
             cls.conn.execute(s, list_to_write)
 
+            logging.info('completed archive of '
+                        + str(len(list_to_write)) + ' records')
+
     @classmethod
-    def get_data(cls, table_name=None, index_table=False, parse_dates=False):
+    def get_data(cls,
+                 table_name=None,
+                 index_table=False,
+                 parse_dates=False,
+                 columns=None,
+                 where_str=None):
+
         if table_name in cls.tables:
+
+            get_whole_table = False
+            if (columns is None) and (where_str is None):
+                get_whole_table = True
+
             table = cls.tables[table_name]
+
             pk_columns = None
             if index_table:
                 pk_columns = table.primary_key.columns.keys()
-            columns = table.columns.keys()
+
+            if columns is None:
+                columns = table.columns.keys()
+
             parse_dates_columns = None
+
             if parse_dates:
                 for column in columns:
                     if table.columns[column].type == sa.sql.sqltypes.Date:
                         parse_dates_columns.append(table.columns[column].name)
-            output = pd.read_sql(sql=table_name,
-                                 con=cls.engine,
-                                 index_col=pk_columns,
-                                 parse_dates=parse_dates_columns)
+
+            sql = "select " + ", ".join(columns) + " from " + table_name
+            if where_str is not None:
+
+                where_str = where_str.replace('where', '')
+                sql += " where " + where_str
+
+            if get_whole_table:
+
+                output = pd.read_sql(sql=table_name,
+                                     con=cls.engine,
+                                     index_col=pk_columns,
+                                     parse_dates=parse_dates_columns,
+                                     columns=columns)
+
+            else:
+
+                output = pd.read_sql(sql=sql,
+                                     con=cls.engine,
+                                     index_col=pk_columns,
+                                     parse_dates=parse_dates_columns)
+
             return output
 
     @classmethod
@@ -403,11 +600,34 @@ class DatabaseInterface(object):
 
         return tickers
 
-
     @classmethod
     def get_equities(cls):
 
         x = 1
+
+    @classmethod
+    def get_futures_series(cls, futures_series=None):
+
+        if utils.is_iterable(futures_series):
+            where_str = " series in {0}".format(tuple(futures_series))
+        else:
+            where_str = " series = '" + futures_series + "'"
+        futures_series_data = cls.get_data(table_name='futures_series',
+                                           where_str=where_str)
+
+        # if utils.is_iterable(futures_series):
+        #     ind = futures_series_data.index[
+        #         futures_series_data['series'].isin(futures_series)]
+        # else:
+        #     ind = futures_series_data.index[
+        #         futures_series_data['series'] == futures_series]
+        #
+        # if len(ind) == 0:
+        #     raise LookupError('cannot find series!')
+        #
+        # futures_series_data = futures_series_data.loc[ind]
+
+        return futures_series_data
 
 
 class ExternalDataApi(object):
@@ -442,7 +662,64 @@ class FigiApi(object):
         return r
 
 
+class BarchartApi(ExternalDataApi):
+
+    # Set API key
+    barchart_api_key = '5c45079e0956acbcf33925204ee4846a'
+    base_url = "http://marketdata.websol.barchart.com/"
+
+    @staticmethod
+    def retrieve_data(data_category=None,
+                      start_date=dt.datetime.today(),
+                      end_date=dt.datetime.today(),
+                      options_dict=None):
+
+        # Any external data API should implement a generic retrieve_data
+        # method that suppors all relevant data retrieval
+        raise NotImplementedError
+
+    @classmethod
+    def retrieve_quote_data(cls, tickers=None):
+
+        tickers_string = ",".join(tickers)
+
+        barchart_api = "getQuote"
+        return_format = "json"
+        req_url = cls.base_url + barchart_api + "." + return_format + "?key=" \
+                + cls.barchart_api_key + "&symbols=" + tickers_string
+
+        response = urllib2.urlopen(req_url)
+        results_dict = json.loads(response.read())
+        df = None
+        if 'results' in results_dict:
+
+            results_list = results_dict['results']
+            df = pd.DataFrame(results_list)
+
+            col_map = {'close': 'close_price',
+                       'lastPrice': 'last_price',
+                       'high': 'high_price',
+                       'open': 'open_price',
+                       'low': 'low_price',
+                       'netChange': 'change',
+                       'tradeTimestamp': 'date'}
+            df = df.rename(columns=col_map)
+
+            fields = ['name', 'close_price', 'high_price', 'low_price',
+                      'last_price', 'low_price', 'open_price', 'volume']
+
+            df.index = [df['symbol'], df['date']]
+            df = df[fields]
+
+
+
+        return df
+
+
 class QuandlApi(ExternalDataApi):
+
+    # Set quandl API
+    ql.ApiConfig.api_key = 'DpFbEBVor9FG2fj1ty73'
 
     @staticmethod
     def retrieve_data(data_category=None,
@@ -456,35 +733,312 @@ class QuandlApi(ExternalDataApi):
 
     @staticmethod
     def get_equity_index_universe():
-        return ['DOW', 'SPX', 'NDX', 'NDX100', 'UKX']
+        return ['DOW', 'SPX', 'NDX_C', 'NDX', 'UKX']
 
     @staticmethod
     def get_futures_universe():
-        quandl_futures = 'https://s3.amazonaws.com/quandl-static-content/Ticker+CSV%27s/Futures/meta.csv'
+        base_url = 'https://s3.amazonaws.com/quandl-static-content/'
+        quandl_futures = base_url + 'Ticker+CSV%27s/Futures/meta.csv'
+        tickers = QuandlApi.retrieve_universe(path=quandl_futures,
+                                              filename='futures.csv')
+        return tickers
 
     @staticmethod
     def get_currency_universe():
-        quandl_currencies = 'https://s3.amazonaws.com/quandl-static-content/Ticker+CSV%27s/currencies.csv'
+        base_url = 'https://s3.amazonaws.com/quandl-static-content/'
+        quandl_currencies = base_url + 'Ticker+CSV%27s/currencies.csv'
+        tickers = QuandlApi.retrieve_universe(
+            path=quandl_currencies,
+            filename='currencies.csv'
+        )
+        return tickers
 
     @staticmethod
     def get_equity_universe(index_ticker):
 
-        quandl_universe = {'DOW': 'https://s3.amazonaws.com/static.quandl.com/tickers/dowjonesA.csv',
-                           'SPX': 'https://s3.amazonaws.com/static.quandl.com/tickers/SP500.csv',
-                           'NDX': 'https://s3.amazonaws.com/static.quandl.com/tickers/NASDAQComposite.csv',
-                           'NDX100': 'https://s3.amazonaws.com/static.quandl.com/tickers/nasdaq100.csv',
-                           'UKX': 'https://s3.amazonaws.com/static.quandl.com/tickers/FTSE100.csv'}
+        base_url = 'https://s3.amazonaws.com/static.quandl.com/tickers/'
 
-        quandl_filenames = {'DOW': 'dowjonesA.csv',
+        quandl_universe = {'INDU': base_url + 'dowjonesA.csv',
+                           'SPX': base_url + 'SP500.csv',
+                           'NDX_C': base_url + 'NASDAQComposite.csv',
+                           'NDX': base_url + 'nasdaq100.csv',
+                           'UKX': base_url + 'FTSE100.csv'}
+
+        quandl_filenames = {'INDU': 'dowjonesA.csv',
                             'SPX': 'SP500.csv',
-                            'NDX': 'NASDAQComposite.csv',
-                            'NDX100': 'nasdaq100.csv',
+                            'NDX_C': 'NASDAQComposite.csv',
+                            'NDX': 'nasdaq100.csv',
                             'UKX': 'FTSE100.csv'}
 
-        tickers = QuandlApi.retrieve_universe(path=quandl_universe[index_ticker],
-                                              filename=quandl_filenames[index_ticker])
+        tickers = QuandlApi.retrieve_universe(
+            path=quandl_universe[index_ticker],
+            filename=quandl_filenames[index_ticker])
+
+        if index_ticker == 'UKX':
+            tickers = [ticker + '.LN' for ticker in tickers]
 
         return tickers
+
+    @staticmethod
+    def bob():
+
+        indices = {'SPX': 'YAHOO/INDEX_GSPC',
+                   'NDX': 'NASDAQOMX/COMP',
+                   'DOW': 'BCB/UDJIAD1',
+                   'RTY': 'YAHOO/INDEX_RUI',
+                   'SHC': 'YAHOO/INDEX_SSEC',
+                   'HSI': 'YAHOO/INDEX_HSI',
+                   'NKY': 'NIKKEI/INDEX',
+                   'DAX': 'YAHOO/INDEX_GDAXI',
+                   'CAC': 'YAHOO/INDEX_FCHI',
+                   'IBOV': 'BCB/7',
+                   'SPTSX': 'YAHOO/INDEX_GSPTSE',
+                   'IBEX': 'YAHOO/INDEX_IBEX',
+                   'KOSPI': 'YAHOO/INDEX_KS11'}
+
+    @staticmethod
+    def get_data(tickers=None, start_date=None, end_date=None):
+
+        """
+        The idea here is to automatically figure out what fields Quandl is
+        returning and get back a data structure that's sensible for that
+        :param tickers:
+        :param start_date:
+        :param end_date:
+        :return:
+        """
+
+        # Quandl API call
+        raw_data = ql.get(tickers,
+                          start_date=start_date,
+                          end_date=dt.datetime.today())
+
+        # Column names are an amalgam of ticker and field
+        data = raw_data.stack()
+        col_names = data.index.get_level_values(1).tolist()
+        long_tickers, fields = zip(*[s.split(' - ') for s in col_names])
+
+        data.index.names = ['date', 'ticker']
+        data = data.reset_index()
+        data['ticker'] = long_tickers
+        data['field'] = fields
+        data.index = [data['ticker'], data['date'], data['field']]
+        del data['ticker']
+        del data['date']
+        del data['field']
+        data = data.unstack('field')
+
+        return data
+
+    @staticmethod
+    def map_futures_columns(df=None):
+        rename_cols = {'Close': 'close_price',
+                       'High': 'high_price',
+                       'Low': 'low_price',
+                       'Open': 'open_price',
+                       'Settle': 'settle_price',
+                       'Prev. Day Open Interest': 'open_interest',
+                       'Total Volume': 'volume'}
+        df = df.rename(columns=rename_cols)
+        return df
+
+    @staticmethod
+    def retrieve_historical_generic_futures_prices(dataset=None,
+                                                   futures_series=None,
+                                                   source_series=None,
+                                                   contract_range=None,
+                                                   start_date=None):
+
+        # Obnoxious, need to manage this stuff somewhere
+        date_field = 'Date'
+        if dataset in ('CHRIS', 'CBOE'):
+            date_field = 'Trade Date'
+        if (dataset == 'CHRIS' and futures_series == 'FVS'):
+            date_field = 'Date'
+
+        generic_ticker_range = contract_range
+        generic_tickers_short = [futures_series + str(i+1)
+                                 for i in generic_ticker_range]
+        generic_tickers = [dataset + '/' + source_series + str(i)
+                           for i in generic_ticker_range]
+        futures_data = pd.DataFrame()
+
+        i = 0
+        for ticker in generic_tickers:
+            try:
+                tmp = ql.get(ticker, start_date=start_date)
+            except:
+                continue
+
+            tmp['ticker'] = generic_tickers_short[i]
+            tmp = tmp[np.isfinite(tmp['Settle'])]
+            tmp = tmp.reset_index()
+            tmp.index = [tmp['ticker'], tmp[date_field]]
+            tmp['contract_number'] = i+1
+
+            if len(futures_data) == 0:
+                futures_data = tmp
+            else:
+                futures_data = futures_data.append(
+                    tmp)
+
+            i += 1
+
+        print(futures_data.head())
+
+        futures_data = futures_data[
+            futures_data[date_field] >= start_date]
+        del futures_data['ticker']
+        del futures_data[date_field]
+
+        return futures_data
+
+    @staticmethod
+    def retrieve_historical_vix_futures_prices(
+            start_date=dt.datetime(2007, 3, 24)):
+
+        dataset = 'CBOE'
+        futures_series = 'VX'
+        futures_data = QuandlApi.retrieve_historical_futures_prices(
+            start_date=start_date,
+            dataset=dataset,
+            futures_series=futures_series
+        )
+        return futures_data
+
+    @staticmethod
+    def retrieve_historical_vstoxx_futures_prices(
+            start_date=dt.datetime(2010, 1, 1)):
+
+        dataset = 'EUREX'
+        futures_series = 'FVS'
+        futures_data = QuandlApi.retrieve_historical_futures_prices(
+            start_date=start_date,
+            dataset=dataset,
+            futures_series=futures_series
+        )
+        return futures_data
+
+    @staticmethod
+    def update_futures_prices(date=dt.datetime.today(),
+                              dataset=None,
+                              futures_series=None,
+                              contract_range=np.arange(1, 10)):
+
+        # Figure out which months to request
+        month = date.month
+        year = date.year
+        months = list()
+        years = list()
+        for c in contract_range:
+
+            months.append(month)
+            years.append(year)
+
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+
+        futures_tickers = list()
+        futures_tickers_df = pd.DataFrame(columns=['year', 'month'])
+
+        for i in range(0, len(months)):
+            year = years[i]
+            month = months[i]
+
+            short_ticker = futures_series + constants.futures_month_codes[
+                month] + str(year)
+            ticker = dataset + "/" + futures_series \
+                     + constants.futures_month_codes[month] + str(year)
+            futures_tickers.append(ticker)
+            futures_tickers_df.loc[ticker, 'year'] = year
+            futures_tickers_df.loc[ticker, 'month'] = month
+            futures_tickers_df.loc[ticker, 'short_ticker'] = short_ticker
+
+        start_date = date - BDay(1)
+        futures_data = QuandlApi.get_data(futures_tickers,
+                                          start_date=start_date)
+
+        if 0 in futures_data.columns:
+            futures_data = futures_data[0]
+
+        futures_data = QuandlApi.map_futures_columns(futures_data)
+
+        futures_tickers_df.index.names = ['ticker']
+        futures_data = futures_tickers_df[['short_ticker']] \
+            .join(futures_data) \
+            .reset_index()
+
+        futures_data.index = [futures_data['short_ticker'], futures_data['date']]
+        futures_data.index.names = ['ticker', 'date']
+        del futures_data['ticker']
+        del futures_data['short_ticker']
+        del futures_data['date']
+
+        return futures_data
+
+    @staticmethod
+    def retrieve_historical_futures_prices(start_date=None,
+                                           dataset=None,
+                                           futures_series=None):
+
+        date_field = 'Date'
+        if dataset == 'CBOE':
+            date_field = 'Trade Date'
+
+        futures_month_codes = {1: 'F',
+                               2: 'G',
+                               3: 'H',
+                               4: 'J',
+                               5: 'K',
+                               6: 'M',
+                               7: 'N',
+                               8: 'Q',
+                               9: 'U',
+                               10: 'V',
+                               11: 'X',
+                               12: 'Z'}
+
+        years = np.arange(start_date.year, dt.datetime.today().year + 2)
+
+        futures_data = pd.DataFrame()
+        futures_tickers = list()
+        futures_tickers_df = pd.DataFrame(columns=['year', 'month'])
+        for year in years:
+            for month in futures_month_codes:
+
+                short_ticker = futures_series + futures_month_codes[
+                    month] + str(year)
+                ticker = dataset + "/" + futures_series \
+                         + futures_month_codes[month] + str(year)
+                futures_tickers.append(ticker)
+                futures_tickers_df.loc[ticker, 'year'] = year
+                futures_tickers_df.loc[ticker, 'month'] = month
+
+                try:
+                    tmp = ql.get(ticker)
+                except:
+                    continue
+
+                tmp['ticker'] = short_ticker
+                tmp = tmp[np.isfinite(tmp['Settle'])]
+                tmp = tmp.reset_index()
+                tmp.index = [tmp['ticker'], tmp[date_field]]
+
+                if len(futures_data) == 0:
+                    futures_data = tmp
+                else:
+                    futures_data = futures_data.append(tmp)
+        futures_data = futures_data[
+            futures_data[date_field] >= start_date]
+        del futures_data['ticker']
+        del futures_data[date_field]
+
+        futures_data = QuandlApi.map_futures_columns(futures_data)
+        futures_data.index.names = ['ticker', 'date']
+
+        return futures_data
 
     @staticmethod
     def retrieve_universe(path, filename):
@@ -492,7 +1046,10 @@ class QuandlApi(ExternalDataApi):
         target = path
         opener.retrieve(target, filename)
         tickers_file = pd.read_csv(filename)
-        tickers = tickers_file['ticker'].values
+        if 'ticker' in tickers_file:
+            tickers = tickers_file['ticker'].values
+        else:
+            tickers=tickers_file
         return tickers
 
 
@@ -659,3 +1216,41 @@ class YahooApi(ExternalDataApi):
         # Calculate forwards
 
         return 1
+
+
+class DataScraper(object):
+
+    @staticmethod
+    def update_vix_settle_price(overwrite_date=None):
+
+        # temp filename to use
+        filename = "data/vix_settle.csv"
+
+        # URL for daily settle prices
+        url = "http://cfe.cboe.com/data/DailyVXFuturesEODValues/DownloadFS.aspx"
+        urllib.urlretrieve(url, filename)
+        data = pd.read_csv(filename + ".csv")
+
+        data = data.reset_index()
+
+        series, dates = zip(*[mystr.split(" ")
+                              for mystr in data['Symbol'].tolist()])
+        dates = pd.to_datetime(dates)
+
+        # Only include monthly futures, ignore weeklies
+        included_indices = list()
+        prices = pd.DataFrame(index=included_indices,
+                              columns=['date', 'maturity_date', 'settle_price'])
+
+        date = utils.workday(dt.datetime.today(), -1)
+        if overwrite_date is not None:
+            date = overwrite_date
+
+        for i in range(0, len(dates)):
+            if series[i] == 'VX':
+                included_indices.append(i)
+                prices.loc[i, 'date'] = date
+                prices.loc[i, 'maturity_date'] = dates[i].date()
+                prices.loc[i, 'settle_price'] = data.loc[i, 'SettlementPrice']
+
+        return prices

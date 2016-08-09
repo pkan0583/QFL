@@ -7,6 +7,22 @@ from scipy.stats import bernoulli
 import pymc
 import matplotlib.pyplot as plt
 
+import qfl.core.constants as constants
+
+
+def garman_klass_volatility(prices=None):
+
+    """
+    :param prices: DataFrame with columns ['high', 'low', 'open', 'close']
+    :return: DataFrame
+    """
+
+    a = 0.5 * np.log(prices['high'] / prices['low']) ** 2
+    b = (2 * np.log(2) - 1) * (np.log(prices['close'] / prices['open'])) ** 2
+    x = float(constants.trading_days_per_year) / len(prices) * (a - b)
+    vol = np.sqrt(x.sum())
+    return vol
+
 
 def _ensure_float(arr=None):
     output = [float(x) for x in arr]
