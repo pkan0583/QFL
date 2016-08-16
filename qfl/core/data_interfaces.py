@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import datetime as dt
 import pandas_datareader.data as pdata
@@ -7,6 +8,7 @@ import numpy as np
 import sqlalchemy as sa
 import urllib
 import dateutil
+import time
 from sqlalchemy.sql.expression import bindparam
 from bs4 import BeautifulSoup
 import requests
@@ -16,618 +18,468 @@ import urllib2
 import simplejson as json
 
 import qfl.core.constants as constants
-import qfl.core.utils as utils
+
+from ib.ext.Contract import Contract
+from ib.ext.Order import Order
+from ib.opt import Connection, message
+from ib.ext.ContractDetails import ContractDetails
+
+import qfl.utilities.basic_utilities as utils
+
+'''
+--------------------------------------------------------------------------------
+INTERACTIVE BROKERS API
+--------------------------------------------------------------------------------
+'''
 
 
-class DatabaseInterface(object):
+class IBApi(object):
 
-    # SqlAlchemy metadata
-    connection_string = None
-    engine = None
-    conn = None
-    metadata = None
-    tables = None
+    ib_username = os.getenv('IB_USERNAME')
+    client_code = 100
+    port_num = 7496
+    tws_conn = None
+    account_value = None
+    portfolio = None
 
-    @classmethod
-    def read_sql(cls, query, parse_dates=None):
-        output = pd.read_sql(sql=query,
-                             con=cls.engine,
-                             parse_dates=parse_dates)
-        return output
+    # These guys are lists of messages passed by the API
+    price_updates = None
+    option_computation_updates = None
+    historical_prices = None
 
-    @classmethod
-    def examples(cls):
+    # Need to adapt these to multiple active requests
+    active_data_symbol = None
+    data_wait = False
 
-        # Grab table
-        time_series_table = cls.get_table('time_series')
+    bar_length_options = (
+        '1 secs',
+        '5 secs',
+        '10 secs',
+        '15 secs',
+        '30 secs',
+        '1 min',
+        '2 mins',
+        '3 mins',
+        '5 mins',
+        '10 mins',
+        '15 mins',
+        '20 mins',
+        '30 mins',
+        '1 hour',
+        '2 hours',
+        '3 hours',
+        '4 hours',
+        '8 hours',
+        '1 day',
+        '1 W',
+        '1 M'
+    )
 
-        # example insert
-        ins = time_series_table.insert().values(id=1,
-                                                date=dt.date(2016, 01, 04),
-                                                field='last_price',
-                                                value=10.25)
+    tick_fields = {
+        0: 'bid_size',
+        1: 'bid_price',
+        2: 'ask_price',
+        3: 'ask_size',
+        4: 'last_price',
+        5: 'last_size',
+        6: 'high_price',
+        7: 'low_price',
+        8: 'volume',
+        9: 'close_price',
+        10: 'bid_option_computation',
+        11: 'ask_option_computation',
+        12: 'last_option_computation',
+        13: 'model_option_computation',
+        14: 'open_tick',
+        22: 'open_interest',
+        23: 'option_historical_vol',
+        24: 'option_implied_vol',
+        25: 'option_bid_exch',
+        26: 'option_ask_exch',
+        27: 'option_call_open_interest',
+        28: 'option_put_open_interest',
+        29: 'option_call_volume',
+        30: 'option_put_volume',
+        45: 'last_timestamp'
+    }
 
-        # commit
-        result = cls.conn.execute(ins)
+    @staticmethod
+    def gen_tick_id():
+        from random import randint
+        i = randint(1, 1000)
+        # while True:
+        #     yield i
+        #     i += 1
+        return i
 
-        # another example insert
-        ins = time_series_table.insert()
-        result = cls.conn.execute(ins,
-                                  id=1,
-                                  date=dt.date(2016, 01, 05),
-                                  field='last_price',
-                                  value=10.15)
+    @staticmethod
+    def error_handler(msg):
+        """Handles the capturing of error messages"""
+        print "Server Error: %s" % msg
 
-        # dictionary insert
-        data = [{'id': 1, 'date': dt.date(2016, 01, 06), 'field': 'last_price', 'value': 10.30},
-                {'id': 1, 'date': dt.date(2016, 01, 07), 'field': 'last_price', 'value': 10.32},
-                {'id': 1, 'date': dt.date(2016, 01, 10), 'field': 'last_price', 'value': 10.31},
-                {'id': 1, 'date': dt.date(2016, 01, 11), 'field': 'last_price', 'value': 10.36},
-        ]
-        cls.conn.execute(time_series_table.insert(), data)
+    @staticmethod
+    def reply_handler(msg):
+        """Handles of server replies"""
+        print "Server Response: %s, %s" % (msg.typeName, msg)
 
-        # Test reading data table
-        tmp = pd.read_sql(sql='test_table',
-                          con=cls.engine,
-                          index_col=['id', 'date', 'field'],
-                          parse_dates=['date'])
+    def portfolio_update_handler(self, msg):
+        """Handles portfolio updates"""
+        if self.portfolio is None:
+            self.portfolio = list()
+        self.portfolio.append(msg)
 
-    @classmethod
-    def initialize(cls):
+    def account_value_update_handler(self, msg):
+        """Handles account updates"""
+        if self.account_value is None:
+            self.account_value = list()
+        self.account_value.append(msg)
 
-        # Database connection string
-        dbname = 'postgres'
-        username = 'postgres'
-        password = 'Thirdgen1'
-        dbtype = 'postgresql'
-        hostname = 'localhost'
-        port = '5422'
-
-        cls.connection_string = dbtype + "://" + username + ":" + password \
-                              + "@" + hostname + ":" + port + "/" + dbname
-        cls.connection_string = "postgresql://postgres:Thirdgen1@localhost:5432/postgres"
-        cls.engine = sa.create_engine(cls.connection_string, echo=False)
-
-        # Connect to the database
-        cls.conn = cls.engine.connect()
-
-        # Metadata object
-        cls.metadata = sa.MetaData()
-
-        # Create tables
-        cls.define_qfl_tables()
-
-    @classmethod
-    def define_qfl_tables(cls):
-
-        # Tables
-        cls.tables = dict()
-
-        # TIME SERIES
-        time_series_table = sa.Table(
-            'time_series', cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('date', sa.Date, primary_key=True),
-            sa.Column('field', sa.String(128), primary_key=True),
-            sa.Column('value', sa.Float, primary_key=False))
-
-        cls.tables['time_series'] = time_series_table
-
-        # EQUITIES
-        equities_table = sa.Table(
-            'equities', cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True, unique=True),
-            sa.Column('ticker', sa.String(64), unique=True, nullable=False),
-            sa.Column('country', sa.String(8), unique=False)
-        )
-
-        cls.tables['equities'] = equities_table
-
-        # EQUITY OPTIONS
-        equity_options_table = sa.Table(
-            'equity_options', cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('ticker', sa.String(64), nullable=False, unique=True),
-            sa.Column('underlying_id', sa.Integer, primary_key=False),
-            sa.Column('option_type', sa.String(16), primary_key=False),
-            sa.Column('strike_price', sa.Float, primary_key=False),
-            sa.Column('maturity_date', sa.Date, primary_key=False),
-            sa.ForeignKeyConstraint(['underlying_id'], ['equities.id']))
-        cls.tables['equity_options'] = equity_options_table
-
-        # EQUITY PRICES
-        equity_prices_table = sa.Table(
-            'equity_prices', cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('date', sa.Date, primary_key=True),
-            sa.Column('adj_close', sa.Float, primary_key=False),
-            sa.Column('last_price', sa.Float, primary_key=False),
-            sa.Column('bid_price', sa.Float, primary_key=False),
-            sa.Column('ask_price', sa.Float, primary_key=False),
-            sa.Column('open_price', sa.Float, primary_key=False),
-            sa.Column('high_price', sa.Float, primary_key=False),
-            sa.Column('low_price', sa.Float, primary_key=False),
-            sa.Column('volume', sa.Float, primary_key=False),
-            sa.ForeignKeyConstraint(['id'], ['equities.id']))
-        cls.tables['equity_prices'] = equity_prices_table
-
-        # EQUITY OPTION PRICES
-        equity_option_prices_table = sa.Table(
-            'equity_option_prices',
-            cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('date', sa.Date, primary_key=True),
-            sa.Column('last_price', sa.Float, primary_key=False),
-            sa.Column('bid_price', sa.Float, primary_key=False),
-            sa.Column('ask_price', sa.Float, primary_key=False),
-            sa.Column('iv', sa.Float, primary_key=False),
-            sa.Column('volume', sa.Float, primary_key=False),
-            sa.Column('open_interest', sa.Float, primary_key=False),
-            sa.Column('spot_price', sa.Float, primary_key=False),
-            sa.Column('quote_time', sa.Time, primary_key=False),
-            sa.ForeignKeyConstraint(['id'], ['equity_options.id']))
-        cls.tables['equity_option_prices'] = equity_option_prices_table
-
-        # EQUITY SCHEDULES
-        equity_schedules_table = sa.Table(
-            'equity_schedules',
-            cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('date', sa.Date, primary_key=True),
-            sa.Column('schedule_type', sa.String(16), primary_key=True),
-            sa.Column('value', sa.Float, primary_key=False),
-            sa.ForeignKeyConstraint(['id'], ['equities.id']))
-        cls.tables['equity_schedules'] = equity_schedules_table
-
-        # EQUITY INDICES
-        equity_index_table = sa.Table(
-            'equity_indices',
-            cls.metadata,
-            sa.Column('index_id', sa.Integer, primary_key=True, unique=True),
-            sa.Column('ticker', sa.String(32), primary_key=False),
-            sa.Column('country', sa.String(8), primary_key=False))
-        cls.tables['equity_indices'] = equity_index_table
-
-        # EQUITY INDEX MEMBERS
-        equity_index_members_table = sa.Table(
-            'equity_index_members',
-            cls.metadata,
-            sa.Column('index_id', sa.Integer, primary_key=True),
-            sa.Column('equity_id', sa.Integer, primary_key=True),
-            sa.Column('valid_date', sa.Date, primary_key=True),
-            sa.ForeignKeyConstraint(['index_id'], ['equity_indices.index_id']),
-            sa.ForeignKeyConstraint(['equity_id'], ['equities.id']))
-        cls.tables['equity_index_members'] = equity_index_members_table
-
-        # FUTURES SERIES
-        futures_series_table = sa.Table(
-            'futures_series',
-            cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('series', sa.String(128), nullable=False),
-            sa.Column('description', sa.String(128), primary_key=False),
-            sa.Column('exchange', sa.String(128), primary_key=False),
-            sa.Column('currency', sa.String(16), nullable=False),
-            sa.Column('contract_size', sa.String(128), primary_key=False),
-            sa.Column('units', sa.String(128), primary_key=False),
-            sa.Column('point_value', sa.Float, primary_key=False),
-            sa.Column('tick_value', sa.Float, primary_key=False),
-            sa.Column('delivery_months', sa.String(16), primary_key=False)
-        )
-        cls.tables['futures_series'] = futures_series_table
-
-        # FUTURES CONTRACTS
-        futures_contracts_table = sa.Table(
-            'futures_contracts',
-            cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('series_id', sa.Integer, nullable=False),
-            sa.Column('ticker', sa.String(32), nullable=False),
-            sa.Column('maturity_date', sa.Date, nullable=False),
-            sa.ForeignKeyConstraint(['series_id'], ['futures_series.id'])
-        )
-        cls.tables['futures_contracts'] = futures_contracts_table
-
-        # FUTURES PRICES
-        futures_prices_table = sa.Table(
-            'futures_prices',
-            cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('date', sa.Date, primary_key=True),
-            sa.Column('last_price', sa.Float, primary_key=False),
-            sa.Column('bid_price', sa.Float, primary_key=False),
-            sa.Column('ask_price', sa.Float, primary_key=False),
-            sa.Column('settle_price', sa.Float, primary_key=False),
-            sa.Column('open_price', sa.Float, primary_key=False),
-            sa.Column('close_price', sa.Float, primary_key=False),
-            sa.Column('high_price', sa.Float, primary_key=False),
-            sa.Column('low_price', sa.Float, primary_key=False),
-            sa.Column('open_interest', sa.Integer, primary_key=False),
-            sa.Column('volume', sa.Integer, primary_key=False),
-            sa.ForeignKeyConstraint(['id'], ['futures_contracts.id'])
-        )
-        cls.tables['futures_prices'] = futures_prices_table
-
-        # GENERIC FUTURES CONTRACTS
-        generic_futures_contracts_table = sa.Table(
-            'generic_futures_contracts',
-            cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('series_id', sa.Integer, nullable=False),
-            sa.Column('ticker', sa.String(32), nullable=False),
-            sa.Column('contract_number', sa.Integer, nullable=False),
-            sa.ForeignKeyConstraint(['series_id'], ['futures_series.id'])
-        )
-        cls.tables['generic_futures_contracts'] = generic_futures_contracts_table
-
-        # GENERIC FUTURES PRICES
-        generic_futures_prices_table = sa.Table(
-            'generic_futures_prices',
-            cls.metadata,
-            sa.Column('id', sa.Integer, primary_key=True),
-            sa.Column('date', sa.Date, primary_key=True),
-            sa.Column('last_price', sa.Float, primary_key=False),
-            sa.Column('bid_price', sa.Float, primary_key=False),
-            sa.Column('ask_price', sa.Float, primary_key=False),
-            sa.Column('settle_price', sa.Float, primary_key=False),
-            sa.Column('open_price', sa.Float, primary_key=False),
-            sa.Column('close_price', sa.Float, primary_key=False),
-            sa.Column('high_price', sa.Float, primary_key=False),
-            sa.Column('low_price', sa.Float, primary_key=False),
-            sa.Column('open_interest', sa.Integer, primary_key=False),
-            sa.Column('volume', sa.Integer, primary_key=False),
-            sa.ForeignKeyConstraint(['id'], ['generic_futures_contracts.id'])
-        )
-        cls.tables['generic_futures_prices'] = generic_futures_prices_table
-
-    @classmethod
-    def create_tables(cls):
-        cls.metadata.create_all(cls.engine)
-
-    @classmethod
-    def get_table(cls, table_name=None):
-        if cls.tables is not None:
-            if table_name in cls.tables:
-                return cls.tables.get(table_name)
-            else:
-                return None
-
-    @classmethod
-    def execute_bulk_insert(cls, df=None, table=None, batch_size=1000):
-
-        num_batches = int(np.ceil(float(len(df)) / batch_size))
-        result = None
-        for i in range(0, num_batches):
-            urange = np.min([(i + 1) * batch_size, len(df)-1])
-            if urange == 0:
-                list_to_write = df.to_dict(orient='records')
-            else:
-                ind = np.arange(i * batch_size, urange)
-                list_to_write = df.iloc[ind].to_dict(orient='records')
-            result = cls.engine.execute(sa.insert(table=table,
-                                                  values=list_to_write))
-        return result
-
-    @classmethod
-    def format_as_tuple_for_query(cls, item):
-
-        if item is None:
-            return
-        if not isinstance(item, (tuple, list)):
-            item = [item]
-        item = tuple(item)
-        return item
-
-    @classmethod
-    def parenthetical_string_list_with_quotes(cls, items):
-        out = "("
-        if not isinstance(items, (tuple, list)):
-            items = [items]
-        counter = 0
-        for item in items:
-            out += "'" + item + "'"
-            counter += 1
-            if counter == len(items):
-                out += ')'
-            else:
-                out += ','
-        return out
-
-    @classmethod
-    def build_pk_where_or_str(cls, df, table, use_column_as_key):
-        where_str = str()
-        if use_column_as_key is None:
-            key_column_names = table.primary_key.columns.keys()
+    def market_data_handler(self, msg):
+        """Handles price updates"""
+        if self.price_updates is None:
+            self.price_updates = list()
+        if msg.price == -1.0:
+            self.data_wait = False
+            x = 1
         else:
-            key_column_names = [use_column_as_key]
-        for i in range(0, len(df)):
-            if where_str != '':
-                where_str += ') or ('
-            else:
-                where_str += '('
-            for key in key_column_names:
-                if key in df:
-                    key_to_write = str(df.iloc[i][key])
-                    if isinstance(table.columns[key].type, sa.String):
-                        key_to_write = "'" + key_to_write + "'"
-                    if isinstance(table.columns[key].type, sa.Date):
-                        key_to_write = "'" + str(pd.to_datetime(key_to_write)) + "'"
-                    if key != key_column_names[0]:
-                        where_str += ' and '
-                    where_str += key + " = " + key_to_write
-        if where_str != '':
-            where_str += ')'
+            self.price_updates.append(msg)
 
-        return where_str, key_column_names
+    def option_computation_handler(self, msg):
+        """Handles option computation updates"""
+        if self.option_computation_updates is None:
+            self.option_computation_updates = list()
+        self.option_computation_updates.append(msg)
 
-    @classmethod
-    def build_pk_where_str(cls, df, table, use_column_as_key):
-        where_str = str()
-        if use_column_as_key is None:
-            key_column_names = table.primary_key.columns.keys()
+    def historical_market_data_handler(self, msg):
+        """ handles historical data updates """
+        if self.historical_prices is None:
+            self.historical_prices = list()
+        if msg.open == -1 or msg.date.__contains__('finished'):
+            self.tws_conn.cancelHistoricalData(msg.tickerId)
+            self.data_wait = False
         else:
-            key_column_names = [use_column_as_key]
-        for key in key_column_names:
-            if key in df:
-                unique_keys = np.unique(df[key])
-                if len(unique_keys) == 1:
-                    t = '(' + str(unique_keys[0]) + ')'
-                else:
-                    t = tuple(unique_keys)
-                if isinstance(table.columns[key].type, sa.String):
-                    unique_keys = [str(k) for k in unique_keys]
-                    t = cls.parenthetical_string_list_with_quotes(unique_keys)
-                if isinstance(table.columns[key].type, sa.Date):
-                    unique_keys = [str(k) for k in pd.to_datetime(unique_keys)]
-                    t = cls.parenthetical_string_list_with_quotes(unique_keys)
-                if where_str != '':
-                    where_str += ' and '
-                if len(unique_keys) == 1:
-                    try:
-                        a = iter(unique_keys)
-                        unique_keys = unique_keys[0]
-                    except:
-                        a = 1
-                where_str += key + " in {0}".format(t)
+            self.historical_prices.append(msg)
 
-        return where_str, key_column_names
+    @staticmethod
+    def create_contract(symbol, sec_type, exch, prim_exch, curr):
+        """Create a Contract object defining what will
+        be purchased, at which exchange and in which currency.
 
-    @classmethod
-    def execute_db_save(cls,
-                        df=None,
-                        table=None,
-                        use_column_as_key=None,
-                        extra_careful=True,
-                        delete_existing=False):
+        symbol - The ticker symbol for the contract
+        sec_type - The security type for the contract ('STK' is 'stock')
+        exch - The exchange to carry out the contract on
+        prim_exch - The primary exchange to carry out the contract on
+        curr - The currency in which to purchase the contract"""
+        contract = Contract()
+        contract.m_symbol = symbol
+        contract.m_secType = sec_type
+        contract.m_exchange = exch
+        contract.m_primaryExch = prim_exch
+        contract.m_currency = curr
+        return contract
 
-        """
-        This is a generic fast method to insert-if-exists-update a database
-        table using SqlAlchemy expression language framework.
-        :param df: DataFrame containing data to be written to table
-        :param table: SqlAlchemy table object
-        :param use_column_as_key string
-        :return: none
-        """
+    @staticmethod
+    def create_order(order_type, quantity, action):
+        """Create an Order object (Market/Limit) to go long/short.
 
-        logging.info('starting archive of '
-                     + str(len(df)) + ' records')
+        order_type - 'MKT', 'LMT' for Market or Limit orders
+        quantity - Integral number of assets to order
+        action - 'BUY' or 'SELL'"""
+        order = Order()
+        order.m_orderType = order_type
+        order.m_totalQuantity = quantity
+        order.m_action = action
+        return order
 
-        # Get where string to identify existing rows
-        if extra_careful:
-            where_str, key_column_names = cls.build_pk_where_or_str(
-                df, table, use_column_as_key)
-        else:
-            where_str, key_column_names = cls.build_pk_where_str(
-                df, table, use_column_as_key)
+    def disconnect(self):
+        return self.tws_conn.disconnect()
 
-        # Grab column names
-        column_names = table.columns.keys()
-        column_list = [table.columns[column_name]
-                       for column_name in column_names]
+    def request_positions(self):
+        self.tws_conn.reqPositions()
 
-        # OK try this: DELETE the stuff that's already there
-        if delete_existing:
-            d = sa.delete(table, whereclause=where_str)
-            cls.conn.execute(d)
+    def request_account_updates(self):
+        self.tws_conn.reqAccountUpdates(True, self.ib_username)
 
-        # Grab the existing data in table corresponding to the new data
-        s = sa.select(columns=column_list).where(where_str)
-        existing_data = pd.read_sql(sql=s,
-                                    con=cls.engine,
-                                    index_col=key_column_names)
+    def initialize(self):
 
-        # Add index to df so that we can identify existing data
-        key_column_names_in_df = list()
-        for key_column in key_column_names:
-            if key_column in df.columns:
-                key_column_names_in_df.append(key_column)
-        df_key_cols = [df[key_column] for key_column in key_column_names_in_df]
+        self.tws_conn = Connection.create(port=self.port_num,
+                                          clientId=self.client_code)
+        self.tws_conn.registerAll(self.reply_handler)
+        self.tws_conn.register(self.portfolio_update_handler,
+                               message.updatePortfolio)
+        self.tws_conn.register(self.account_value_update_handler,
+                               message.updateAccountValue)
+        self.tws_conn.register(self.market_data_handler,
+                               message.tickPrice)
+        self.tws_conn.register(self.option_computation_handler,
+                               message.tickOptionComputation)
+        self.tws_conn.register(self.historical_market_data_handler,
+                               message.historicalData)
+        self.tws_conn.connect()
 
-        if use_column_as_key is None:
-            if len(key_column_names_in_df) > 0:
-                df.index = df_key_cols
-        else:
-            orig_key_cols = table.primary_key.columns.keys()
-            df.index = df[use_column_as_key]
-            existing_data = existing_data.reset_index()
-            existing_data.index = existing_data[use_column_as_key]
-
-        # New df structures for insert and update
-        insert_df = pd.DataFrame(columns=df.columns)
-        update_df = pd.DataFrame(columns=df.columns)
-
-        # Now we figure out what part of the df is already in existing_data
-        for ind in df.index.values:
-            if ind in existing_data.index:
-                update_df = update_df.append(df.loc[ind])
-            else:
-                insert_df = insert_df.append(df.loc[ind])
-
-        # Insert part is easy
-        if len(insert_df) > 0:
-            insert_df = insert_df.reset_index()
-            cls.execute_bulk_insert(insert_df, table)
-
-        # Generic version of update using bindparams
-        if len(update_df) > 0:
-
-            update_df_mod = update_df
-
-            # If we used an alternative column for the key (e.g. if the table's
-            # primary key is an autoincrement integer) we need to join to get it
-            if use_column_as_key is not None:
-                join_cols = [use_column_as_key] + orig_key_cols
-                try:
-                    existing_data = existing_data.reset_index()
-                except:
-                    existing_data.index = existing_data[orig_key_cols]
-                update_df_mod = pd.merge(left=existing_data[join_cols],
-                                         right=update_df,
-                                         on=key_column_names)
-
-            # Cannot use database column names as bindparams (odd)
-            for col in key_column_names:
-                update_df_mod = update_df_mod.rename(columns={col: col + "_"})
-
-            # Dictionary format for records
-            list_to_write = update_df_mod.to_dict(orient='records')
-
-            # Build the update command
-            s = table.update()
-            for col in key_column_names:
-                s = s.where(table.c[col] == bindparam(col + "_"))
-            values_dict = dict()
-            for col in key_column_names:
-                values_dict[col] = bindparam(col)
-            s.values(values_dict)
-
-            # Execute the update command
-            cls.conn.execute(s, list_to_write)
-
-            logging.info('completed archive of '
-                        + str(len(list_to_write)) + ' records')
-
-    @classmethod
-    def get_data(cls,
-                 table_name=None,
-                 index_table=False,
-                 parse_dates=False,
-                 columns=None,
-                 where_str=None):
-
-        if table_name in cls.tables:
-
-            get_whole_table = False
-            if (columns is None) and (where_str is None):
-                get_whole_table = True
-
-            table = cls.tables[table_name]
-
-            pk_columns = None
-            if index_table:
-                pk_columns = table.primary_key.columns.keys()
-
-            if columns is None:
-                columns = table.columns.keys()
-
-            parse_dates_columns = None
-
-            if parse_dates:
-                for column in columns:
-                    if table.columns[column].type == sa.sql.sqltypes.Date:
-                        parse_dates_columns.append(table.columns[column].name)
-
-            sql = "select " + ", ".join(columns) + " from " + table_name
-            if where_str is not None:
-
-                where_str = where_str.replace('where', '')
-                sql += " where " + where_str
-
-            if get_whole_table:
-
-                output = pd.read_sql(sql=table_name,
-                                     con=cls.engine,
-                                     index_col=pk_columns,
-                                     parse_dates=parse_dates_columns,
-                                     columns=columns)
-
-            else:
-
-                output = pd.read_sql(sql=sql,
-                                     con=cls.engine,
-                                     index_col=pk_columns,
-                                     parse_dates=parse_dates_columns)
-
-            return output
-
-    @classmethod
-    def get_equity_ids(cls, equity_tickers=None):
-
-        ids = list()
-        equities = cls.get_data(table_name='equities')
-
-        if equity_tickers is None:
-
-            ids = equities['id'].tolist()
-
-        else:
-
-            equities.index = equities['ticker']
-
-            for ticker in equity_tickers:
-                if ticker in equities.index:
-                    ids.append(equities.loc[ticker, 'id'])
-
-        return ids
-
-    @classmethod
-    def get_equity_tickers(cls, ids=None):
-
-        tickers = list()
-        equities = cls.get_data(table_name='equities')
-
-        if ids is None:
-
-            tickers = equities['ticker'].tolist()
-
-        else:
-
-            equities.index = equities['id']
-
-            for id in ids:
-                if id in equities.index:
-                    tickers.append(equities.loc[id, 'ticker'])
-
-        return tickers
-
-    @classmethod
-    def get_equities(cls):
-
-        x = 1
-
-    @classmethod
-    def get_futures_series(cls, futures_series=None):
-
-        if utils.is_iterable(futures_series):
-            where_str = " series in {0}".format(tuple(futures_series))
-        else:
-            where_str = " series = '" + futures_series + "'"
-        futures_series_data = cls.get_data(table_name='futures_series',
-                                           where_str=where_str)
-
-        # if utils.is_iterable(futures_series):
-        #     ind = futures_series_data.index[
-        #         futures_series_data['series'].isin(futures_series)]
-        # else:
-        #     ind = futures_series_data.index[
-        #         futures_series_data['series'] == futures_series]
+    # def connect(self):
+        # Connect to the Trader Workstation (TWS) running on the
+        # usual port of 7496, with a clientId of 100
+        # (The clientId is chosen by us and we will need
+        # separate IDs for both the execution connection and
+        # market data connection)
+        # tws_conn = Connection.create(port=self.port_num,
+        #                              clientId=self.client_code)
+        # tws_conn.connect()
         #
-        # if len(ind) == 0:
-        #     raise LookupError('cannot find series!')
-        #
-        # futures_series_data = futures_series_data.loc[ind]
+        # # Assign the error handling function defined above
+        # # to the TWS connection
+        # tws_conn.register(self.error_handler, 'Error')
 
-        return futures_series_data
+        # Assign all of the server reply messages to the
+        # reply_handler function defined above
+        # tws_conn.registerAll(self.reply_handler)
+
+        # # Create an order ID which is 'global' for this session. This
+        # # will need incrementing once new orders are submitted.
+        # order_id = 1
+        #
+        # # Create a contract in GOOG stock via SMART order routing
+        # goog_contract = IBApi.create_contract('GOOG', 'STK', 'SMART', 'SMART', 'USD')
+        #
+        # # Go long 100 shares of Google
+        # goog_order = IBApi.create_order('MKT', 100, 'BUY')
+        #
+        # # Use the connection to the send the order to IB
+        # tws_conn.placeOrder(order_id, goog_contract, goog_order)
+        #
+        # # Disconnect from TWS
+        # tws_conn.disconnect()
+
+    def retrieve_historical_prices(self,
+                                   ticker=None,
+                                   currency=None,
+                                   security_type=None,
+                                   exchange=None,
+                                   strike_price=None,
+                                   maturity_date=None,
+                                   option_type=None,
+                                   multiplier=None,
+                                   duration_str=None,
+                                   bar_size=None):
+
+        self.active_data_symbol = ticker
+
+        px_contract = IBApi.create_contract(
+            symbol=ticker,
+            sec_type=security_type,
+            exch=exchange,
+            curr=currency,
+            prim_exch=exchange
+        )
+        px_contract.m_strike = strike_price
+        px_contract.m_expiry = maturity_date
+        px_contract.m_right = option_type
+        px_contract.m_multiplier = multiplier
+
+        tick_id = 1
+        end_time = time.strftime('%Y%m%d %H:%M:%S')
+
+        # Get bids
+        self.tws_conn.reqHistoricalData(tickerId=tick_id,
+                                        contract=px_contract,
+                                        endDateTime=end_time,
+                                        durationStr=duration_str,
+                                        barSizeSetting=bar_size,
+                                        whatToShow='BID',
+                                        useRTH=0,
+                                        formatDate=1)
+
+        self.data_wait = True
+        i = 0
+        while self.data_wait and i < 90:
+            print(i)
+            i += 1
+            time.sleep(1)
+
+        historical_data = self.process_historical_prices(
+            self.historical_prices)
+
+        raw_historical_data = list(self.historical_prices)
+        self.historical_prices = None
+
+        return historical_data, raw_historical_data
+
+    def process_option_computations(self, option_computations):
+
+        column_map = {'tickerId': 'ticker_id',
+                      'field': 'field',
+                      'impliedVol': 'implied_volatility',
+                      'delta': 'delta',
+                      'gamma': 'gamma',
+                      'vega': 'vega',
+                      'theta': 'theta',
+                      'undPrice': 'underlying_price',
+                      'pvDividend': 'pv_dividend',
+                      'optPrice': 'price'}
+
+        option_computations_df = pd.DataFrame(columns=column_map.values())
+
+        for i in range(0, len(option_computations)):
+            for col in column_map:
+                data_i = dict(option_computations[i].items())
+                option_computations_df.loc[i, column_map[col]] = data_i[col]
+
+        option_computations_df['ticker'] = self.active_data_symbol
+
+        return option_computations_df
+
+    def process_historical_prices(self, historical_prices):
+
+        column_map = {'date': 'date',
+                      'open': 'open_price',
+                      'close': 'close_price',
+                      'low': 'low_price',
+                      'high': 'high_price',
+                      'volume': 'volume',
+                      'WAP': 'vwap'}
+
+        prices_df = pd.DataFrame(columns=column_map.values())
+
+        for i in range(0, len(historical_prices)):
+            for col in column_map:
+                data_i = dict(historical_prices[i].items())
+                prices_df.loc[i, column_map[col]] = data_i[col]
+
+        prices_df['ticker'] = self.active_data_symbol
+
+        return prices_df
+
+    def process_prices(self, prices):
+
+        column_map = {'tickerId': 'ticker_id',
+                      'field': 'price_type',
+                      'price': 'price'}
+
+        prices_df = pd.DataFrame(columns=column_map.values())
+
+        for i in range(0, len(prices)):
+            for col in column_map:
+                data_i = dict(prices[i].items())
+                prices_df.loc[i, column_map[col]] = data_i[col]
+
+        prices_df['ticker'] = self.active_data_symbol
+
+        return prices_df
+
+    def retrieve_prices(self,
+                        underlying_ticker=None,
+                        security_ticker=None,
+                        currency=None,
+                        security_type=None,
+                        exchange=None,
+                        strike_price=None,
+                        maturity_date=None,
+                        option_type=None,
+                        multiplier=None,
+                        subscribe=False):
+
+        px_contract = IBApi.create_contract(
+            symbol=underlying_ticker,
+            sec_type=security_type,
+            exch=exchange,
+            curr=currency,
+            prim_exch=exchange
+        )
+        px_contract.m_localSymbol = security_ticker
+        px_contract.m_strike = strike_price
+        px_contract.m_expiry = maturity_date
+        px_contract.m_right = option_type
+        px_contract.m_multiplier = multiplier
+
+        ticker_id = self.gen_tick_id()
+
+        self.tws_conn.reqMktData(ticker_id, px_contract, '', False)
+
+        self.data_wait = True
+        if not subscribe:
+            i = 0
+            while self.data_wait and i < 90:
+                print(i)
+                i += 1
+                time.sleep(1)
+
+            prices_df = self.process_prices(self.price_updates)
+            return prices_df, self.price_updates
+
+    def retrieve_contracts(self, ticker, currency, security_type):
+
+        def watcher(msg):
+            print msg
+
+        def contract_details_handler(msg):
+            contracts.append(msg.contractDetails.m_summary)
+
+        def retrieve_data_end_handler(msg):
+            self.data_wait = False
+
+        self.tws_conn.registerAll(watcher)
+        self.tws_conn.register(contract_details_handler, 'ContractDetails')
+        self.tws_conn.register(retrieve_data_end_handler, 'ContractDetailsEnd')
+
+        # self.tws_conn.connect()
+
+        contract = Contract()
+        contract.m_exchange = "SMART"
+        contract.m_secType = security_type
+        contract.m_symbol = ticker
+        # contract.m_multiplier = "100"
+        contract.m_currency = currency
+
+        self.tws_conn.reqContractDetails(1, contract)
+
+        contracts = []
+
+        self.data_wait = True
+        i = 0
+        while self.data_wait and i < 90:
+            print(i)
+            i += 1
+            time.sleep(1)
+
+        contracts_df = IBApi.process_contracts(contracts=contracts,
+                                               security_type=security_type)
+
+        return contracts_df, contracts
+
+    @staticmethod
+    def process_contracts(contracts=None, security_type=None):
+
+        contracts_df = None
+
+        if security_type == 'OPT':
+
+            cols = ['ticker', 'underlying', 'strike', 'maturity_date',
+                    'option_type']
+            contracts_df = pd.DataFrame(index=range(0, len(contracts)),
+                                        columns=cols)
+            for i in range(0, len(contracts)):
+                contracts_df.loc[i] = [contracts[i].m_localSymbol.replace(" ", ""),
+                                       contracts[i].m_symbol,
+                                       contracts[i].m_strike,
+                                       contracts[i].m_expiry,
+                                       contracts[i].m_right]
+
+            contracts_df['option_type'] = contracts_df['option_type'].str.replace(
+                'P', 'put')
+            contracts_df['option_type'] = contracts_df['option_type'].str.replace(
+                'C', 'call')
+            contracts_df['maturity_date'] = pd.to_datetime(
+                contracts_df['maturity_date'])
+
+        return contracts_df
+
+
+'''
+--------------------------------------------------------------------------------
+EXTERNAL DATA API
+--------------------------------------------------------------------------------
+'''
 
 
 class ExternalDataApi(object):
@@ -643,29 +495,84 @@ class ExternalDataApi(object):
         raise NotImplementedError
 
 
+'''
+--------------------------------------------------------------------------------
+FIGI API
+--------------------------------------------------------------------------------
+'''
+
+
 class FigiApi(object):
+    """
+    www.openfigi.com
+    Supported identifiers:
+    ID_ISIN
+    ID_BB_UNIQUE
+    ID_SEDOL
+    ID_COMMON
+    ID_WERTPAPIER
+    ID_CUSIP
+    ID_BB
+    ID_ITALY
+    ID_EXCH_SYMBOL
+    ID_FULL_EXCHANGE_SYMBOL
+    COMPOSITE_ID_BB_GLOBAL
+    ID_BB_GLOBAL_SHARE_CLASS_LEVEL
+    ID_BB_SEC_NUM_DES
+    ID_BB_GLOBAL
+    TICKER
+    ID_CUSIP_8_CHR
+    OCC_SYMBOL
+    UNIQUE_ID_FUT_OPT
+    OPRA_SYMBOL
+    TRADING_SYSTEM_IDENTIFIER
+    """
 
     base_url = 'https://api.openfigi.com/v1/mapping'
-    api_key = "471197f1-50fe-429b-9e11-a6828980e213"
+    api_key = os.getenv('FIGI_API_KEY')
 
     @classmethod
     def retrieve_mapping(cls, id_type=None, ids=None, exch_codes=None):
-        req_data = list()
+        request_dict = list()
         for i in range(0, len(ids)):
-            req_data.append({"idType": id_type,
-                             "idValue": ids[i],
-                             "exchCode": exch_codes[i]})
+            request_dict.append({"idType": id_type,
+                                 "idValue": ids[i],
+                                 "exchCode": exch_codes[i]})
+        return cls.retrieve_mapping_by_dict(request_dict=request_dict)
+
+    @classmethod
+    def retrieve_mapping_by_dict(cls, request_dict=None):
         r = requests.post(cls.base_url,
                           headers={"Content-Type": "text/json",
                                    "X-OPENFIGI-APIKEY": cls.api_key},
-                          json=req_data)
-        return r
+                          json=request_dict)
+        mapping = r.json()
+        data = None
+        if len(mapping) > 0:
+            for i in range(0, len(mapping)):
+                if 'data' in mapping[i].keys():
+                    if data is None:
+                        data = pd.DataFrame.from_dict(mapping[i]['data'],
+                                                      orient='columns')
+                    else:
+                        data = data.append(pd.DataFrame.from_dict(
+                            mapping[i]['data'],
+                            orient='columns'))
+
+            column_map = {'compositeFIGI': 'composite_figi_id',
+                          'exchCode': 'exchange_code',
+                          'marketSector': 'bbg_sector',
+                          'figi': 'figi_id',
+                          'securityType': 'security_sub_type'}
+            data = data.rename(columns=column_map)
+
+        return data
 
 
 class BarchartApi(ExternalDataApi):
 
     # Set API key
-    barchart_api_key = '5c45079e0956acbcf33925204ee4846a'
+    barchart_api_key = os.getenv('BARCHART_API_KEY')
     base_url = "http://marketdata.websol.barchart.com/"
 
     @staticmethod
@@ -711,15 +618,20 @@ class BarchartApi(ExternalDataApi):
             df.index = [df['symbol'], df['date']]
             df = df[fields]
 
-
-
         return df
+
+
+'''
+--------------------------------------------------------------------------------
+QUANDL API
+--------------------------------------------------------------------------------
+'''
 
 
 class QuandlApi(ExternalDataApi):
 
     # Set quandl API
-    ql.ApiConfig.api_key = 'DpFbEBVor9FG2fj1ty73'
+    ql.ApiConfig.api_key = os.getenv('QUANDL_API_KEY')
 
     @staticmethod
     def retrieve_data(data_category=None,
@@ -780,13 +692,13 @@ class QuandlApi(ExternalDataApi):
         return tickers
 
     @staticmethod
-    def bob():
+    def get_equity_index_identifiers():
 
         indices = {'SPX': 'YAHOO/INDEX_GSPC',
                    'NDX': 'NASDAQOMX/COMP',
-                   'DOW': 'BCB/UDJIAD1',
+                   'INDU': 'BCB/UDJIAD1',
                    'RTY': 'YAHOO/INDEX_RUI',
-                   'SHC': 'YAHOO/INDEX_SSEC',
+                   'SHCOMP': 'YAHOO/INDEX_SSEC',
                    'HSI': 'YAHOO/INDEX_HSI',
                    'NKY': 'NIKKEI/INDEX',
                    'DAX': 'YAHOO/INDEX_GDAXI',
@@ -794,10 +706,20 @@ class QuandlApi(ExternalDataApi):
                    'IBOV': 'BCB/7',
                    'SPTSX': 'YAHOO/INDEX_GSPTSE',
                    'IBEX': 'YAHOO/INDEX_IBEX',
-                   'KOSPI': 'YAHOO/INDEX_KS11'}
+                   'KOSPI2': 'YAHOO/INDEX_KS11'}
+
+        return indices
 
     @staticmethod
-    def get_data(tickers=None, start_date=None, end_date=None):
+    def get(quandl_codes=None, start_date=None, end_date=None):
+
+        raw_data = ql.get(quandl_codes,
+                          start_date=start_date,
+                          end_date=end_date)
+        return raw_data
+
+    @staticmethod
+    def get_data(tickers=None, start_date=None, end_date=dt.datetime.today()):
 
         """
         The idea here is to automatically figure out what fields Quandl is
@@ -811,7 +733,7 @@ class QuandlApi(ExternalDataApi):
         # Quandl API call
         raw_data = ql.get(tickers,
                           start_date=start_date,
-                          end_date=dt.datetime.today())
+                          end_date=end_date)
 
         # Column names are an amalgam of ticker and field
         data = raw_data.stack()
@@ -853,11 +775,11 @@ class QuandlApi(ExternalDataApi):
         date_field = 'Date'
         if dataset in ('CHRIS', 'CBOE'):
             date_field = 'Trade Date'
-        if (dataset == 'CHRIS' and futures_series == 'FVS'):
+        if dataset == 'CHRIS' and futures_series == 'FVS':
             date_field = 'Date'
 
         generic_ticker_range = contract_range
-        generic_tickers_short = [futures_series + str(i+1)
+        generic_tickers_short = [futures_series + str(i)
                                  for i in generic_ticker_range]
         generic_tickers = [dataset + '/' + source_series + str(i)
                            for i in generic_ticker_range]
@@ -874,7 +796,7 @@ class QuandlApi(ExternalDataApi):
             tmp = tmp[np.isfinite(tmp['Settle'])]
             tmp = tmp.reset_index()
             tmp.index = [tmp['ticker'], tmp[date_field]]
-            tmp['contract_number'] = i+1
+            tmp['contract_number'] = contract_range[i]
 
             if len(futures_data) == 0:
                 futures_data = tmp
@@ -884,12 +806,14 @@ class QuandlApi(ExternalDataApi):
 
             i += 1
 
-        print(futures_data.head())
+        if len(futures_data) > 0:
+            futures_data = futures_data[
+                futures_data[date_field] >= start_date]
+            del futures_data['ticker']
+            del futures_data[date_field]
 
-        futures_data = futures_data[
-            futures_data[date_field] >= start_date]
-        del futures_data['ticker']
-        del futures_data[date_field]
+        else:
+            logging.info("no data retrieved...")
 
         return futures_data
 
@@ -908,7 +832,7 @@ class QuandlApi(ExternalDataApi):
 
     @staticmethod
     def retrieve_historical_vstoxx_futures_prices(
-            start_date=dt.datetime(2010, 1, 1)):
+            start_date=dt.datetime(2012, 1, 1)):
 
         dataset = 'EUREX'
         futures_series = 'FVS'
@@ -920,10 +844,13 @@ class QuandlApi(ExternalDataApi):
         return futures_data
 
     @staticmethod
-    def update_futures_prices(date=dt.datetime.today(),
-                              dataset=None,
-                              futures_series=None,
-                              contract_range=np.arange(1, 10)):
+    def update_daily_futures_prices(date=None,
+                                    dataset=None,
+                                    futures_series=None,
+                                    contract_range=np.arange(1, 10)):
+
+        if date is None:
+            date = utils.workday(dt.datetime.today(), -1)
 
         # Figure out which months to request
         month = date.month
@@ -987,31 +914,18 @@ class QuandlApi(ExternalDataApi):
         if dataset == 'CBOE':
             date_field = 'Trade Date'
 
-        futures_month_codes = {1: 'F',
-                               2: 'G',
-                               3: 'H',
-                               4: 'J',
-                               5: 'K',
-                               6: 'M',
-                               7: 'N',
-                               8: 'Q',
-                               9: 'U',
-                               10: 'V',
-                               11: 'X',
-                               12: 'Z'}
-
         years = np.arange(start_date.year, dt.datetime.today().year + 2)
 
         futures_data = pd.DataFrame()
         futures_tickers = list()
         futures_tickers_df = pd.DataFrame(columns=['year', 'month'])
         for year in years:
-            for month in futures_month_codes:
+            for month in constants.futures_month_codes:
 
-                short_ticker = futures_series + futures_month_codes[
+                short_ticker = futures_series + constants.futures_month_codes[
                     month] + str(year)
                 ticker = dataset + "/" + futures_series \
-                         + futures_month_codes[month] + str(year)
+                         + constants.futures_month_codes[month] + str(year)
                 futures_tickers.append(ticker)
                 futures_tickers_df.loc[ticker, 'year'] = year
                 futures_tickers_df.loc[ticker, 'month'] = month
@@ -1052,8 +966,27 @@ class QuandlApi(ExternalDataApi):
             tickers=tickers_file
         return tickers
 
+'''
+--------------------------------------------------------------------------------
+YAHOO API
+--------------------------------------------------------------------------------
+'''
+
 
 class YahooApi(ExternalDataApi):
+
+    @staticmethod
+    def map_price_columns(prices_df):
+
+        column_map = {'Open': 'open_price',
+                      'High': 'high_price',
+                      'Low': 'low_price',
+                      'Close': 'last_price',
+                      'Volume': 'volume',
+                      'Adj Close': 'adj_close'}
+
+        prices_df = prices_df.rename(columns=column_map)
+        return prices_df
 
     @staticmethod
     def retrieve_data(data_category=None,
@@ -1078,11 +1011,18 @@ class YahooApi(ExternalDataApi):
     @staticmethod
     def retrieve_prices(equity_tickers=None,
                         start_date=None,
-                        end_date=dt.datetime.today()):
+                        end_date=dt.datetime.today(),
+                        change_to_data_frame_from_panel=True):
 
         data = pdata.get_data_yahoo(symbols=equity_tickers,
                                     start=start_date,
                                     end=end_date)
+
+        if change_to_data_frame_from_panel:
+            if isinstance(data, pd.Panel):
+                data = data.to_frame()
+
+        data = YahooApi.map_price_columns(data)
 
         return data
 
@@ -1196,6 +1136,10 @@ class YahooApi(ExternalDataApi):
         return options_data, expiry_dates
 
     @staticmethod
+    def process_options_data(raw_options_data=None, expiry_dates=None):
+        x=1
+
+    @staticmethod
     def extract_attributes_from_option_symbol(symbol, underlying_ticker):
         symbol = symbol.replace(underlying_ticker, '')
         year = 2000 + int(symbol[0:2])
@@ -1216,6 +1160,36 @@ class YahooApi(ExternalDataApi):
         # Calculate forwards
 
         return 1
+
+    @staticmethod
+    def get_equity_index_identifiers():
+
+        universe_mapping = {
+            'SPX': '^GSPC',
+            'RTY': '^RUT',
+            'INDU': '^DJI',
+            'CAC': '^FCHI',
+            'DAX': '^GDAXI',
+            'UKX': '^FTSE',
+            'NDX': '^NDX',
+            'NDX_C': '^IXIC',
+            'HSI': '^HSI',
+            'HSCEI': '^HSCE',
+            'NKY': '^N225',
+            'SPTSX': '^GSPTSE',
+            'AS51': '^AXJO',
+            'SHCOMP': '^SSE',
+            'KOSPI2': '^KS200'
+        }
+
+        return universe_mapping
+
+
+'''
+--------------------------------------------------------------------------------
+DATA SCRAPER
+--------------------------------------------------------------------------------
+'''
 
 
 class DataScraper(object):

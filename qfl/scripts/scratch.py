@@ -10,17 +10,17 @@ import pymc
 import requests
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter, A4
-import sqlalchemy as sa
-from sqlalchemy.sql.expression import Insert, Select, and_, or_, bindparam
 import statsmodels.tsa.stattools as sm
-import qfl.core.data_interfaces as qfl_data
-from qfl.core.data_interfaces import DatabaseInterface as db, QuandlApi
+import qfl.core.data_interfaces as data_int
+import qfl.core.database_interface as qfl_data
+from qfl.core.data_interfaces import QuandlApi, YahooApi
+from qfl.core.database_interface import DatabaseInterface as db
+from qfl.core.database_interface import DatabaseUtilities as dbutils
+import qfl.core.market_data as md
 import qfl.macro.macro_models as macro
 import qfl.etl.data_ingest as etl
 import qfl.core.calcs as lib
-import qfl.core.utils as utils
-from qfl.core.data_interfaces import YahooApi
-import qfl.utilities.BasicUtilities as bu
+import qfl.utilities.basic_utilities as utils
 from scipy import interpolate
 import matplotlib.ticker as mtick
 from matplotlib import cm
@@ -28,9 +28,133 @@ import logging
 from pandas.tseries.offsets import BDay
 
 reload(etl)
+reload(utils)
 reload(qfl_data)
-from qfl.core.data_interfaces import DatabaseInterface as db, QuandlApi
+reload(data_int)
+reload(md)
+
+from qfl.core.data_interfaces import QuandlApi, YahooApi, IBApi, FigiApi
+from qfl.core.database_interface import DatabaseInterface as db, DatabaseUtilities as dbutils
+
 db.initialize()
+
+'''
+--------------------------------------------------------------------------------
+VIX futures
+--------------------------------------------------------------------------------
+'''
+
+futures_series = 'FVS'
+price_field = 'settle_price'
+start_date = dt.datetime(2007, 1, 1)
+
+etl.ingest_historical_futures_days_to_maturity(futures_series=futures_series,
+                                               start_date=start_date,
+                                               generic=True)
+print('done!')
+
+futures_prices = md.get_generic_futures_prices_from_series(
+    futures_series=futures_series,
+    start_date=start_date,
+    include_contract_map=True)
+
+start_dates = pd.to_datetime(
+    futures_prices.index.get_level_values('date')).tolist()
+end_dates = pd.to_datetime(futures_prices['maturity_date']).values.tolist()
+futures_prices['days_to_maturity'] = utils.networkdays(
+    start_date=start_dates,
+    end_date=end_dates
+)
+
+
+
+
+
+'''
+--------------------------------------------------------------------------------
+Returns distributions
+--------------------------------------------------------------------------------
+'''
+
+ticker = 'TLT'
+price_field = 'last_price'
+start_date = dt.datetime(2000, 1, 1)
+return_window_days = 126
+
+prices = md.get_stock_prices(ticker,
+                             price_field=price_field,
+                             start_date=start_date)
+prices = prices[price_field]
+returns = prices / prices.shift(return_window_days) - 1
+
+returns = returns[np.isfinite(returns)]
+plt.hist(returns, bins=20)
+
+# Neutralize the rates trend over the period
+demeaned_returns = returns - returns.mean(axis=0)
+plt.hist(demeaned_returns, bins=20)
+
+
+'''
+--------------------------------------------------------------------------------
+INTERACTIVE BROKERS API
+--------------------------------------------------------------------------------
+'''
+
+ib_api = IBApi()
+ib_api.initialize()
+
+contracts_df, contracts = ib_api.retrieve_contracts('SPY', 'USD', 'OPT')
+
+prices_df, prices = ib_api.retrieve_prices(
+    underlying_ticker='SPY',
+    maturity_date='20161216',
+    strike_price=200,
+    option_type='P',
+    security_type='OPT',
+    exchange='SMART',
+    currency='USD',
+    multiplier=100,
+    subscribe=True
+)
+
+prices_df, prices = ib_api.retrieve_prices(
+    underlying_ticker='SPY',
+    security_type='OPT',
+    exchange='SMART',
+    currency='USD',
+    strike_price=200,
+    maturity_date='20161216',
+    option_type='P',
+    multiplier=100
+)
+
+test_contract = ib_api.create_contract(
+    symbol='SPY',
+    sec_type='STK',
+    exch='SMART',
+    prim_exch='SMART',
+    curr='USD'
+)
+
+duration_str = "10 D"
+bar_size = '1 hour'
+
+historical_data, raw_historical_data = \
+    ib_api.retrieve_historical_prices(
+        ticker='SPY',
+        multiplier=100,
+        strike_price=200,
+        maturity_date='20161216',
+        option_type='P',
+        currency='USD',
+        security_type='OPT',
+        exchange='SMART',
+        duration_str="1 M",
+        bar_size="30 mins"
+)
+
+historical_data = ib_api.process_historial_prices(ib_api.historical_prices)
 
 # etl.add_equities_from_index(ticker='NDX', country='US', _db=db)
 
@@ -49,7 +173,7 @@ etl.load_historical_futures_prices(
     start_date=dt.datetime(2012, 1, 1)
 )
 
-etl.load_historical_generic_futures_prices(
+etl.ingest_historical_generic_futures_prices(
     _db=db,
     dataset=dataset,
     contract_range=contract_range,
@@ -59,70 +183,11 @@ etl.load_historical_generic_futures_prices(
 )
 
 
-futures_data = QuandlApi.retrieve_historical_generic_futures_prices(
-    start_date=start_date,
-    futures_series=futures_series,
-    source_series=source_series,
-    contract_range=contract_range,
-    dataset=dataset)
-futures_data.index.names = ['ticker', 'date']
-futures_data = futures_data.reset_index()
-
-# Contracts
-futures_contracts_table = db.get_table(
-    table_name='generic_futures_contracts')
-contracts_retrieved = pd.DataFrame(futures_data.groupby('ticker')
-                                   .last()['contract_number'])
-futures_series_data = db.get_data(table_name='futures_series')
-ind = futures_series_data.index[
-    futures_series_data['series'] == futures_series]
-series_id = futures_series_data.loc[ind, 'id'].values[0]
-contracts_retrieved['series_id'] = series_id
-contracts_retrieved = contracts_retrieved.reset_index()
-
-_db.execute_db_save(df=contracts_retrieved,
-                    table=futures_contracts_table,
-                    use_column_as_key='ticker',
-                    extra_careful=False)
-
-# Prices
-futures_prices_table = _db.get_table(table_name='generic_futures_prices')
-futures_data['open_interest'] = \
-    futures_data['Prev. Day Open Interest'].shift(-1)
-rename_cols = {'Close': 'close_price',
-               'High': 'high_price',
-               'Low': 'low_price',
-               'Open': 'open_price',
-               'Settle': 'settle_price',
-               'Total Volume': 'volume'}
-futures_data = futures_data.rename(columns=rename_cols)
-
-# Filter for valid prices
-futures_data = futures_data[
-    futures_data['settle_price'] > 0]
-
-# Join with id
-futures_contracts = _db.get_data(table_name='generic_futures_contracts')
-
-tmp = pd.merge(left=futures_contracts[['id', 'ticker']],
-               right=futures_data,
-               on='ticker')
-
-for col in tmp.columns:
-    if col not in futures_prices_table.columns.keys():
-        del tmp[col]
-
-
-
-
-
-
-
-
-
-#############################################################################
-# Macro
-#############################################################################
+'''
+--------------------------------------------------------------------------------
+MACRO
+--------------------------------------------------------------------------------
+'''
 
 reload(macro)
 
@@ -326,7 +391,7 @@ etl.load_historical_futures_prices(
     dataset=dataset
 )
 
-etl.load_historical_generic_futures_prices(
+etl.ingest_historical_generic_futures_prices(
     _db=db,
     start_date=start_date,
     futures_series='FVS',
@@ -336,14 +401,14 @@ etl.load_historical_generic_futures_prices(
 )
 
 # Get updated VIX futures data
-vix_data = qfl_data.QuandlApi.update_futures_prices(
+vix_data = qfl_data.QuandlApi.update_daily_futures_prices(
     date=dt.datetime.today(),
     dataset='CBOE',
     futures_series='VX',
     contract_range=np.arange(0, 10)
 )
 
-v2x_data = qfl_data.QuandlApi.update_futures_prices(
+v2x_data = qfl_data.QuandlApi.update_daily_futures_prices(
     date=dt.datetime.today(),
     dataset='EUREX',
     futures_series='FVS',
@@ -433,7 +498,7 @@ print(quote) # quote is a dict
 
 reload(etl)
 reload(qfl_data)
-from qfl.core.data_interfaces import DatabaseInterface as db
+from qfl.core.database_interface import DatabaseInterface as db
 
 # Database stuff
 db.initialize()
@@ -446,27 +511,27 @@ etl.daily_equity_price_ingest()
 date = utils.closest_business_day()
 data_source = 'yahoo'
 
-etl.load_historical_equity_prices(ids=None,
-                                  start_date=etl.default_start_date,
-                                  end_date=date,
-                                  data_source=data_source,
-                                  _db=db)
+etl.ingest_historical_equity_prices(ids=None,
+                                    start_date=etl.default_start_date,
+                                    end_date=date,
+                                    data_source=data_source,
+                                    _db=db)
 
 equities, equity_prices_table, ids, equity_tickers, rows = \
-    etl._prep_equity_price_load(ids=None, _db=db)
+    etl._prep_equity_price_ingest(ids=None, _db=db)
 
 
-etl.update_equity_prices(ids=None, data_source='yahoo', _db=db)
+etl.update_equity_prices(ids=None, data_source_name='yahoo', _db=db)
 print('done!')
 
 
 
 _id = ids[0]
-etl._load_historical_equity_prices(_id,
-                                   start_date=date,
-                                   end_date=date,
-                                   data_source='yahoo',
-                                   _db=db)
+etl._ingest_historical_equity_prices(_id,
+                                     start_date=date,
+                                     end_date=date,
+                                     data_source_name='yahoo',
+                                     _db=db)
 
 
 
@@ -476,11 +541,11 @@ etl.update_option_prices_one(id_=id_, db=db)
 ids = [3642, 3643]
 etl.update_option_prices(ids, 'yahoo', db)
 
-etl._load_historical_equity_prices(_id=3642,
-                                   start_date=None,
-                                   end_date=None,
-                                   data_source='yahoo',
-                                   _db=db)
+etl._ingest_historical_equity_prices(_id=3642,
+                                     start_date=None,
+                                     end_date=None,
+                                     data_source_name='yahoo',
+                                     _db=db)
 
 # Test load of options prices from yahoo
 start_date = dt.datetime(1990, 1, 1)
@@ -558,7 +623,7 @@ equity_tickers = equity_tickers[0:1]
 
 ids = db.get_equity_ids(equity_tickers)
 
-date = utils.closest_business_day()
+date = qfl.utilities.basic_utilities.closest_business_day()
 
 expiry_dates, links = pdata.YahooOptions('ABBV') \
     ._get_expiry_dates_and_links()

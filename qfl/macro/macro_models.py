@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 import struct
 
-import qfl.utilities.BasicUtilities as bu
+import qfl.utilities.basic_utilities as bu
 
 default_start_date = dt.datetime(1980, 1, 1)
 

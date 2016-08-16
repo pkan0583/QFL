@@ -1,4 +1,6 @@
 
+invalid_value = -999.0
+
 trading_days_per_year = 252.0
 
 futures_month_codes = {1: 'F',
