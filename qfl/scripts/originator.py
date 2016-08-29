@@ -52,8 +52,8 @@ portfolio_target_weights = {
 }
 
 start_date = dt.datetime(2007, 7, 1)
-prices = mkt_data.get_stock_prices(portfolio_target_weights.keys(),
-                                   start_date=start_date)
+prices = mkt_data.get_equity_prices(portfolio_target_weights.keys(),
+                                    start_date=start_date)
 prices = prices['adj_close'].unstack(level='ticker')
 
 daily_returns = prices / prices.shift(1) - 1

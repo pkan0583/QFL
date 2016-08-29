@@ -16,63 +16,667 @@ import qfl.core.database_interface as qfl_data
 from qfl.core.data_interfaces import QuandlApi, YahooApi
 from qfl.core.database_interface import DatabaseInterface as db
 from qfl.core.database_interface import DatabaseUtilities as dbutils
+import qfl.core.calcs as calcs
 import qfl.core.market_data as md
 import qfl.macro.macro_models as macro
 import qfl.etl.data_ingest as etl
 import qfl.core.calcs as lib
 import qfl.utilities.basic_utilities as utils
+import qfl.core.constants as constants
 from scipy import interpolate
 import matplotlib.ticker as mtick
 from matplotlib import cm
 import logging
 from pandas.tseries.offsets import BDay
+from scipy import interpolate
 
-reload(etl)
+reload(calcs)
 reload(utils)
 reload(qfl_data)
 reload(data_int)
 reload(md)
+reload(etl)
 
-from qfl.core.data_interfaces import QuandlApi, YahooApi, IBApi, FigiApi
+from qfl.core.data_interfaces import QuandlApi, YahooApi, IBApi, FigiApi, DataScraper
 from qfl.core.database_interface import DatabaseInterface as db, DatabaseUtilities as dbutils
+from qfl.utilities.chart_utilities import format_plot
+from qfl.utilities.nlp import DocumentsAnalyzer as da
+
+from collections import defaultdict
+from gensim import corpora, models, similarities
+import odo
 
 db.initialize()
 
+# Mapping
+etl.process_optionworks_mappings()
+
+
 '''
 --------------------------------------------------------------------------------
-VIX futures
+Nutmeg export
 --------------------------------------------------------------------------------
 '''
 
-futures_series = 'FVS'
+import xmltodict
+import simplejson as json
+
+xml_file = open("data/AM.xml")
+am_dict = xmltodict.parse(xml_file)
+
+xml_file = open("data/NH.xml")
+nh_dict = xmltodict.parse(xml_file)
+
+nh_data = nh_dict['userSummaryAdmins']['userSummaryAdmin']
+nh_account_data = nh_data['accounts']['account']
+test_json = json.dumps(nh_data)
+test_json_extract = json.loads(test_json)
+
+# Example funds with relatively large balances (main funds)
+nh_savings_fund_general = nh_account_data[1]['funds']['fund'][6]
+nh_pension_fund_general = nh_account_data[0]['funds']['fund'][2]
+
+# Contributions
+nh_contributions = nh_savings_fund_general['contributionActivity']['postingSummary']
+
+# Mapping contributions data into tabular format
+nh_c_df = pd.DataFrame(index=range(0, len(nh_contributions)),
+                       columns=nh_contributions[0].keys())
+for i in range(0, len(nh_contributions)):
+    nh_c_df.loc[i] = nh_contributions[i].values()
+
+# Some formatting issues
+nh_c_df['value'] = pd.to_numeric(nh_c_df['value'])
+nh_c_df['postedDate'] = pd.to_datetime(pd.to_datetime(
+    nh_c_df['postedDate']).dt.date)
+nh_c_df = nh_c_df.sort_values('postedDate')
+
+# Transactions
+nh_transactions = nh_savings_fund_general['stockSummaries']['stockSummary']
+
+# Transaction data columns
+columns = ['sequence',
+           'postedDate',
+           'transactionType',
+           'transactionRef',
+           'assetCode',
+           'units',
+           'value']
+
+# Mapping the transaction data into tabular format
+nh_t_df = pd.DataFrame(columns=columns)
+counter = 0
+for i in range(0, len(nh_transactions)):
+    posted_date = nh_transactions[i]['postedDate']
+    entries = nh_transactions[i]['entries']
+    for j in range(0, len(entries)):
+        if 'transactionType' in entries[j]:
+            nh_t_df.loc[counter] = entries[j].values()
+            counter += 1
+
+# Some formatting issues
+nh_t_df['value'] = pd.to_numeric(nh_t_df['value'])
+nh_t_df['units'] = pd.to_numeric(nh_t_df['units'])
+nh_t_df['postedDate'] = pd.to_datetime(pd.to_datetime(
+    nh_t_df['postedDate']).dt.date)
+nh_t_df = nh_t_df.sort('postedDate')
+
+# Security code universe
+unique_asset_codes = np.unique(nh_t_df['assetCode'])
+
+# I'm not exactly sure how this is different... non-stock trades? AH DIVS ETC
+nh_investments = nh_savings_fund_general['investmentActivity']['postingSummary']
+nh_i_df = pd.DataFrame(index=range(0, len(nh_investments)),
+                       columns=nh_investments[0].keys() + ['transactionText'])
+for i in range(0, len(nh_investments)):
+    nh_i_df.loc[i] = nh_investments[i]
+nh_i_df['value'] = pd.to_numeric(nh_i_df['value'])
+nh_i_df['units'] = pd.to_numeric(nh_i_df['units'])
+nh_i_df['postedDate'] = pd.to_datetime(
+    pd.to_datetime(nh_i_df['postedDate']).dt.date)
+nh_i_df = nh_i_df.sort_values('postedDate')
+
+# Identify dividends
+nh_i_df['transactionText'] = nh_i_df['transactionText'].fillna(value='')
+nh_divs = nh_i_df[nh_i_df['transactionText'].str.contains('Dividend')]
+nh_adjs = nh_i_df[nh_i_df['transactionText'].str.contains('Adjustment')]
+
+# Export
+nh_c_df.to_excel("data/nh_contributions.xlsx")
+nh_t_df.to_excel("data/nh_transactions.xlsx")
+
+'''
+--------------------------------------------------------------------------------
+Market prices
+--------------------------------------------------------------------------------
+'''
+
+# Get data from the beginning of the account
+start_date = nh_data['fromDate']
+
+# Tickers for yahoo and quandl
+tickers = [code + '.L' for code in unique_asset_codes]
+quandl_tickers = ['LSE/' + code for code in unique_asset_codes]
+
+# Raw quandl data
+raw_price_data_ql = QuandlApi.get_data(tickers=quandl_tickers,
+                                       start_date=start_date)
+price_data_ql = raw_price_data_ql.copy(deep=True).reset_index()
+
+# Adjust stuff that is quoted in Pence
+ql_lse = pd.read_csv('data/LSE-datasets-codes.csv', header=None)
+quoted_in_pence = ql_lse[ql_lse[1].str.contains('GBX')][0].values.tolist()
+quoted_in_usd = ql_lse[ql_lse[1].str.contains('USD')].values.tolist()
+ind = price_data_ql.index[price_data_ql['ticker'].isin(quoted_in_pence)]
+price_data_ql.loc[ind, ['Change', 'High', 'Last Close', 'Low', 'Price']] /= 100.0
+
+# Revert tickers
+price_data_ql['ticker'] = price_data_ql['ticker'].str\
+                              .replace('LSE/', '')\
+                              .astype(str) + '.L'
+price_data_ql = price_data_ql.set_index(['date', 'ticker'], drop=True)
+price_data_ql.index.names = ['date', 'asset_id']
+price_data_ql = price_data_ql.sort_index()
+
+# Try to get some data
+price_field_yf = 'Adj Close'
+raw_price_data_yf = pdata.get_data_yahoo(tickers, start=start_date)
+price_data_yf = raw_price_data_yf.to_frame()[price_field_yf]
+price_data_yf.index.names = ['date', 'asset_id']
+
+price_tickers = np.unique(price_data_yf.index.get_level_values('asset_id'))
+price_tickers = [str(ticker) for ticker in price_tickers]
+
+# Missing
+missing_tickers = list(set(tickers) - set(price_tickers))
+
+# Price data to use
+price_data = price_data_ql
+price_field = 'Last Close'
+
+# Yield curve
+yc_data = DataScraper.retrieve_uk_yield_curve()
+uk_cash_rate = yc_data[1].fillna(method='ffill')
+
+'''
+--------------------------------------------------------------------------------
+Personal Consultant performance analysis
+--------------------------------------------------------------------------------
+'''
+
+# Next steps here are:
+# 1) "market value" --> needs to reflect market prices not transactions
+# 2) need to adjust cash to reflect transactions
+# 3) handle currencies
+# 4) handle asset id for various exchanges
+
+reload(utils)
+
+cash_flows = nh_c_df.sort_values('postedDate')
+transactions = nh_t_df.sort_values('postedDate')
+
+# Standardize columns
+col_map = {'postedDate': 'date',
+           'units': 'quantity',
+           'value': 'market_value',
+           'assetCode': 'asset_id'}
+cash_flows = cash_flows.rename(columns=col_map)
+transactions = transactions.rename(columns=col_map)
+security_income = nh_divs.rename(columns=col_map)
+other_adjustments = nh_adjs.rename(columns=col_map)
+
+# This is nutmeg: assume everything on London exchange
+transactions['asset_id'] = transactions['asset_id'].astype(str) + '.L'
+
+# Standardize date formats
+cash_flows['date'] = pd.to_datetime(cash_flows['date'].dt.date)
+transactions['date'] = pd.to_datetime(transactions['date'].dt.date)
+
+# Change sells to negative quantity
+ind = transactions.index[transactions['transactionType'] == 'SLD']
+transactions.loc[ind, ['quantity', 'market_value']] *= -1.0
+
+# Start date
+start_date = pd.to_datetime(cash_flows['date'].min())
+end_date = pd.to_datetime(cash_flows['date'].max())
+calendar_name = 'UnitedKingdom'
+
+# This is Nutmeg: assume all transactions in GBP
+base_currency = 'GBP'
+transactions['currency'] = base_currency
+cash_flows['currency'] = base_currency
+base_asset = 'cash_' + base_currency
+
+# Columns
+cols = ['date', 'quantity', 'market_value']
+
+# Dates
+dates = utils.DateUtils.get_business_date_range(start_date,
+                                                end_date,
+                                                calendar_name)
+start_date = dates[0]
+
+# Initial positions
+initial_positions = pd.DataFrame(index=[pd.Series(base_asset)],
+                                 columns=cols)
+initial_positions.index.names = ['asset_id']
+initial_positions.loc[base_asset, ['quantity', 'market_value']] \
+    = cash_flows[cash_flows['date'] == start_date]['market_value'].values[0]
+initial_positions.loc[base_asset, 'date'] = start_date
+
+# Iterate over dates
+positions_dict = dict()
+positions_dict[0] = initial_positions
+for t in range(1, len(dates)):
+
+    # Starting point: carry over positions
+    positions_dict[t] = positions_dict[t-1].copy(deep=True)
+    positions_dict[t]['date'] = dates[t]
+
+    # Cash balances accrue interest
+    elapsed_days = (dates[t] - dates[t-1]).days
+    daily_rate = uk_cash_rate[(uk_cash_rate.index >= dates[t - 1])
+                            & (uk_cash_rate.index < dates[t])].mean()
+
+    # Carry over prior value
+    if np.isnan(daily_rate):
+        daily_rate = prev_daily_rate
+    prev_daily_rate = daily_rate
+
+    positions_dict[t].loc[base_asset, ['quantity', 'market_value']] \
+        *= (1 + daily_rate) * elapsed_days / 365.0
+
+    # New cash flows
+    # TODO: what if the cash flow is in a different currency
+    cf = cash_flows[(cash_flows['date'] <= dates[t])
+                  & (cash_flows['date'] > dates[t - 1])]
+    positions_dict[t].loc[base_asset, ['quantity', 'market_value']]\
+        += cf['market_value'].sum()
+
+    # Security income
+    # TODO: what if the cash flow is in a different currency
+    si = security_income[(security_income['date'] <= dates[t])
+                       & (security_income['date'] > dates[t - 1])]
+    positions_dict[t].loc[base_asset, ['quantity', 'market_value']]\
+        += si['market_value'].sum()
+
+    # Adjustments
+    # TODO: what if the cash flow is in a different currency
+    oa = other_adjustments[(other_adjustments['date'] <= dates[t])
+                         & (other_adjustments['date'] > dates[t - 1])]
+    positions_dict[t].loc[base_asset, ['quantity', 'market_value']]\
+        += oa['market_value'].sum()
+
+    # New transactions
+    tt = transactions[(transactions['date'] <= dates[t])
+                    & (transactions['date'] > dates[t - 1])]
+    if len(tt) > 0:
+
+        # Debit cash account for transactions
+        positions_dict[t].loc[base_asset, ['quantity', 'market_value']]\
+            -= tt['market_value'].sum()
+
+        # Changes in existing positions
+        ind = tt.index[tt['asset_id'].isin(positions_dict[t].index)]
+        if len(ind) > 0:
+            asset_codes = tt.loc[ind, 'asset_id']
+            positions_dict[t].loc[asset_codes, ['quantity', 'market_value']] \
+                += tt.loc[ind, ['quantity', 'market_value']].values
+        # New positions
+        new_ind = tt.index[~tt['asset_id'].isin(positions_dict[t].index)]
+        if len(new_ind) > 0:
+            asset_codes = tt.loc[new_ind, 'asset_id']
+            new_df = pd.DataFrame(index=asset_codes,
+                                  columns=cols,
+                                  data=tt.loc[new_ind, cols]
+                                  .values)
+            positions_dict[t] = positions_dict[t].append(new_df)
+
+    # Mark the book
+    price_data_date = price_data[
+        price_data.index.get_level_values('date') == dates[t]].reset_index()
+    price_data_date.index = price_data_date['asset_id']
+    ind = positions_dict[t].index[
+        positions_dict[t].index.isin(price_data_date.index)]
+    positions_dict[t].loc[ind, 'market_value'] = \
+        positions_dict[t].loc[ind, 'quantity'] \
+        * price_data_date.loc[ind, price_field]
+
+positions = pd.concat(positions_dict).reset_index()
+positions.index = [positions['date'], positions['asset_id']]
+positions = positions.rename(columns={'level_0': 'date_index'})
+
+# Join positions data to price for visual inspection
+positions = positions.join(price_data['Price'])
+positions[positions.index.get_level_values('asset_id') == base_asset] = 1.0
+del positions['asset_id']
+del positions['date']
+
+account_performance = pd.DataFrame(positions['market_value'].groupby(level='date').sum())
+account_performance['daily_flows'] = cash_flows.groupby('date')['market_value'].sum()
+account_performance['daily_flows'] = account_performance['daily_flows'] .fillna(value=0)
+account_performance['pnl'] = account_performance['market_value'].diff(1)\
+                             - account_performance['daily_flows']
+account_performance['pnl_pct'] = account_performance['pnl'] \
+                                 / account_performance['market_value'].shift(1)
+
+# plt.plot((1 + account_performance['pnl_pct']).cumprod()-1)
+plt.plot(account_performance['market_value'])
+plt.ylabel('account value, GBP')
+plt.title('Reconstructed Savings Fund Value (actual end = 155,477)')
+
+'''
+--------------------------------------------------------------------------------
+OptionWorks data
+--------------------------------------------------------------------------------
+'''
+
+# data = md.get_optionworks_staging_ivm(codes=['CME_ES_EW4_'])
+
+futures_series = 'C'
+maturity_type = 'futures_contract'
+start_date = dt.datetime(2009, 1, 1)
+
+etl.process_optionworks_data_ivs(series_id=futures_series,
+                                 start_date=start_date,
+                                 maturity_type='constant_maturity')
+
+'''
+--------------------------------------------------------------------------------
+Positioning analysis
+--------------------------------------------------------------------------------
+'''
+
+futures_series = 'VX'
+start_date = dt.datetime(2010, 1, 1)
+vix_tenor_days = 21
+vol_lookahead_days = 21
+vol_trailing_days = 63
+
+cftc_data = md.get_cftc_positioning_by_series(futures_series, start_date)
+cftc_data.index = cftc_data['date']
+
+lev_net = cftc_data["Lev_Money_Positions_Long_All"] \
+          - cftc_data['Lev_Money_Positions_Short_All']
+lev_net.name = 'lev_net'
+
+vix_futures_px = md.get_constant_maturity_futures_prices_by_series(
+    futures_series='VX', start_date=start_date)['price']\
+    .unstack('days_to_maturity')
+
+# Rolling returns
 price_field = 'settle_price'
-start_date = dt.datetime(2007, 1, 1)
-
-etl.ingest_historical_futures_days_to_maturity(futures_series=futures_series,
-                                               start_date=start_date,
-                                               generic=True)
-print('done!')
-
-futures_prices = md.get_generic_futures_prices_from_series(
-    futures_series=futures_series,
+level_change = True
+days_to_zero_around_roll = 1
+futures_returns = md.get_rolling_futures_returns_by_series(
+    futures_series='VX',
     start_date=start_date,
-    include_contract_map=True)
-
-start_dates = pd.to_datetime(
-    futures_prices.index.get_level_values('date')).tolist()
-end_dates = pd.to_datetime(futures_prices['maturity_date']).values.tolist()
-futures_prices['days_to_maturity'] = utils.networkdays(
-    start_date=start_dates,
-    end_date=end_dates
+    level_change=True
 )
 
+data = pd.DataFrame(vix_futures_px[vix_tenor_days]).reset_index()
+data.index = data['date']
+del data['date']
 
+data = data.join(lev_net).join(futures_returns)
+data = data.reset_index().drop_duplicates('date')
+data.index = data['date']
+data = data.rename(columns={vix_tenor_days: price_field})
+
+data['lev_net'] = data['lev_net'].fillna(method='ffill')
+data['lev_net_z'] = (data['lev_net'] - data['lev_net'].mean()) \
+                    / data['lev_net'].std()
+
+data['fut_pnl'] = data['VX1'].shift(-vol_lookahead_days)\
+                             .rolling(window=vol_lookahead_days)\
+                             .sum()
+data['cum_fut_pnl'] = data['VX1'].cumsum()
+data['vol'] = data['VX1'].rolling(window=vol_trailing_days,
+                                  center=False).std()
+data['fut_vol'] = data['vol'].shift(-vol_trailing_days)
+
+t1 = pd.ols(y=data['fut_pnl'], x=data[[price_field, 'lev_net_z']])
+t2 = pd.ols(y=data['fut_vol'], x=data[[price_field, 'vol', 'lev_net_z']])
+
+
+plot_cols = ['VX1', 'VX2', 'VX3', 'VX4', 'VX5', 'VX6']
+plt.plot(futures_returns[plot_cols].cumsum())
+plt.legend(plot_cols)
+
+from statsmodels import regression as reg
+from statsmodels import tools as smtools
+exog = data[[vix_tenor_days, 'lev_net_z']].values
+exog = smtools.tools.add_constant(exog)
+t3 = reg.linear_model.GLSAR(endog=data['fut_pnl'].values,
+                            exog=exog,
+                            missing='drop',
+                            rho=5,
+                            hasconst=True)
+
+# Neuberger overlapping estimator
+# for t in range(0, len(data)):
 
 
 
 '''
 --------------------------------------------------------------------------------
-Returns distributions
+NLP for matching futures descriptions
+--------------------------------------------------------------------------------
+'''
+
+
+s = 'select distinct id, series, description from futures_series'
+qfl_1 = db.read_sql(s)
+
+s = 'select distinct "Market_and_Exchange_Names", "CFTC_Contract_Market_Code",' \
+    ' "CFTC_Market_Code"' \
+    'from staging_cftc_positioning'
+cftc_1 = db.read_sql(s)
+
+s = 'select distinct "Market_and_Exchange_Names", "CFTC_Contract_Market_Code",' \
+    ' "CFTC_Market_Code"' \
+    'from staging_cftc_positioning_financial'
+cftc_2 = db.read_sql(s)
+
+cftc = cftc_1.append(cftc_2)
+# documents = cftc['Market_and_Exchange_Names'].values.tolist()
+documents = qfl_1['description'].values.tolist()
+
+# Hyphens are really screwing this all up, let's kill them
+for i in range(0, len(documents)):
+    documents[i] = documents[i].replace('-', ' ')
+
+common_words = set('for a of the and to in - '.split())
+
+texts = da.remove_common_words(documents, common_words)
+texts = da.remove_solitary_words(texts)
+dictionary = corpora.Dictionary(texts)
+
+corpus = [dictionary.doc2bow(text) for text in texts]
+
+lsi = models.LsiModel(corpus, id2word=dictionary, num_topics=20)
+
+
+
+matches = 3
+cftc.index = range(0, len(cftc))
+match_df = cftc.copy(deep=True)
+
+
+# convert the query to LSI space
+for i in range(544, len(cftc)):
+
+    df = pd.DataFrame(index=range(0, len(documents)),
+                      columns=['overlap', 'description', 'series', 'id'])
+    series_description = cftc.iloc[i]['Market_and_Exchange_Names']
+    series_description = series_description.replace('-', ' ')
+    for k in range(0, 5):
+        series_description = series_description.replace("  ", " ")
+    series_des_analyze = da.remove_common_words(
+        series_description.lower().split(), common_words=common_words)
+    series_des_analyze = [s[0] for s in series_des_analyze
+                          if len(s) > 0]
+    print(series_description)
+
+    counter = 0
+    for text in texts:
+        _int = set(series_des_analyze).intersection(set(text))
+        df.loc[counter, 'overlap'] = len(_int)
+        df.loc[counter, 'description'] = documents[counter]
+        df.loc[counter, 'series'] = qfl_1.loc[counter, 'series']
+        df.loc[counter, 'id'] = qfl_1.loc[counter, 'id']
+        counter += 1
+
+    vec_bow = dictionary.doc2bow(series_description.lower().split())
+    vec_lsi = lsi[vec_bow]
+
+    # perform a similarity query against the corpus
+    index = similarities.MatrixSimilarity(lsi[corpus])
+    sims = index[vec_lsi]
+
+    sims_df = pd.DataFrame(sims, columns=['similarity'])
+    sims_df['name'] = documents
+    sims_df.sort_values('similarity', ascending=False).head()
+    df['lda_similarity'] = sims_df['similarity']
+
+    df = df.sort_values(['overlap', 'lda_similarity'], ascending=False)
+
+    for m in range(0, matches):
+        match_df.loc[i, 'match_' + str(m)] = df.iloc[m]['description']
+        match_df.loc[i, 'series_' + str(m)] = df.iloc[m]['series']
+
+        match_df.loc[i, 'overlap_' + str(m)] = df.iloc[m]['overlap']
+        match_df.loc[i, 'lda_similarity' + str(m)] = df.iloc[m]['lda_similarity']
+
+match_df.to_excel('data/cftc_qfl_code_mapping.xlsx')
+
+'''
+--------------------------------------------------------------------------------
+GENSIM tutorial
+--------------------------------------------------------------------------------
+'''
+
+from gensim import corpora, models, similarities
+
+documents = ["Human machine interface for lab abc computer applications",
+          "A survey of user opinion of computer system response time",
+          "The EPS user interface management system",
+          "System and human system engineering testing of EPS",
+          "Relation of user perceived response time to error measurement",
+          "The generation of random binary unordered trees",
+          "The intersection graph of paths in trees",
+          "Graph minors IV Widths of trees and well quasi ordering",
+          "Graph minors A survey"]
+
+# remove common words and tokenize
+stoplist = set('for a of the and to in'.split())
+texts = [[word for word in document.lower().split() if word not in stoplist]
+      for document in documents]
+
+# remove words that appear only once
+from collections import defaultdict
+frequency = defaultdict(int)
+for text in texts:
+ for token in text:
+     frequency[token] += 1
+
+texts = [[token for token in text if frequency[token] > 1]
+      for text in texts]
+
+from pprint import pprint  # pretty-printer
+pprint(texts)
+
+# store the dictionary, for future reference
+dictionary = corpora.Dictionary(texts)
+dictionary.save('/tmp/deerwester.dict')
+pprint(dictionary)
+pprint(dictionary.token2id)
+
+# the word "interaction" does not appear in the dictionary and is ignored
+new_doc = "Human computer interaction"
+new_vec = dictionary.doc2bow(new_doc.lower().split())
+print(new_vec)
+
+# store to disk, for later use
+corpus = [dictionary.doc2bow(text) for text in texts]
+corpora.MmCorpus.serialize('/tmp/deerwester.mm', corpus)
+
+class MyCorpus(object):
+     def __iter__(self):
+         for line in open('mycorpus.txt'):
+             # assume there's one document per line, tokens separated by whitespace
+             yield dictionary.doc2bow(line.lower().split())
+
+corpus_memory_friendly = MyCorpus()  # doesn't load the corpus into memory!
+print(corpus_memory_friendly)
+
+dictionary = corpora.Dictionary.load('/tmp/deerwester.dict')
+corpus = corpora.MmCorpus('/tmp/deerwester.mm')
+print(corpus)
+
+lsi = models.LsiModel(corpus, id2word=dictionary, num_topics=2)
+
+# convert the query to LSI space
+doc = "Human computer interaction"
+vec_bow = dictionary.doc2bow(doc.lower().split())
+vec_lsi = lsi[vec_bow]
+print(vec_lsi)
+
+# transform corpus to LSI space and index it
+index = similarities.MatrixSimilarity(lsi[corpus])
+
+# Saving and loading index
+index.save('/tmp/deerwester.index')
+index = similarities.MatrixSimilarity.load('/tmp/deerwester.index')
+
+# perform a similarity query against the corpus
+sims = index[vec_lsi]
+pprint(list(enumerate(sims)))
+
+sims = sorted(enumerate(sims), key=lambda item: -item[1])
+pprint(sims)
+
+'''
+--------------------------------------------------------------------------------
+Rolling PCA?
+--------------------------------------------------------------------------------
+'''
+
+etf_tickers, etf_exchange_codes = md.get_etf_universe()
+
+prices = md.get_equity_prices(tickers=etf_tickers,
+                              start_date=md.history_default_start_date)
+prices = prices['adj_close'].unstack('ticker')
+
+# Every month we run a PCA on the last year's overlapping weekly returns
+
+
+'''
+--------------------------------------------------------------------------------
+Get latest VIX termstructure
+--------------------------------------------------------------------------------
+'''
+
+date = dt.date.today()
+
+prices = md.get_constant_maturity_futures_prices_by_series(futures_series='VX')
+prices = md.get_futures_prices_by_series(futures_series='VX')
+
+ind = prices.index[prices.index.get_level_values('date') >= pd.to_datetime(date)]
+prices.loc[ind, ['days_to_maturity', 'seasonality_adj_price']]\
+    .sort_values('days_to_maturity')
+
+
+ts = prices.loc[ind, ['days_to_maturity', 'seasonality_adj_price']]\
+    .sort_values('days_to_maturity')
+
+fig, ax = plt.subplots(figsize=[10, 6])
+plt.scatter(ts['days_to_maturity'], ts['seasonality_adj_price'], color='r')
+format_plot(ax, 'red', 'black')
+
+'''
+--------------------------------------------------------------------------------
+Historical return distributions
 --------------------------------------------------------------------------------
 '''
 
@@ -81,9 +685,9 @@ price_field = 'last_price'
 start_date = dt.datetime(2000, 1, 1)
 return_window_days = 126
 
-prices = md.get_stock_prices(ticker,
-                             price_field=price_field,
-                             start_date=start_date)
+prices = md.get_equity_prices(ticker,
+                              price_field=price_field,
+                              start_date=start_date)
 prices = prices[price_field]
 returns = prices / prices.shift(return_window_days) - 1
 
@@ -166,15 +770,13 @@ _db = db
 contract_range = np.arange(0, 8)
 start_date = dt.datetime(2012, 1,1 )
 
-etl.load_historical_futures_prices(
-    _db=db,
+etl.ingest_historical_futures_prices(
     dataset=dataset,
     futures_series=futures_series,
     start_date=dt.datetime(2012, 1, 1)
 )
 
 etl.ingest_historical_generic_futures_prices(
-    _db=db,
     dataset=dataset,
     contract_range=contract_range,
     start_date=start_date,
@@ -357,105 +959,52 @@ for f1 in settings.data_fields:
 # AWS
 #############################################################################
 
-import ib
-from ib.opt import ibConnection
-tws = ibConnection( host = 'localhost',port= 7496, clientId = 123)
-tws.reqAccountUpdates(True,'accountnumber')
-
-#############################################################################
-# VIX futures
-#############################################################################
-
-reload(etl)
-reload(qfl_data)
-from qfl.core.data_interfaces import DatabaseInterface as db
-from qfl.core.data_interfaces import QuandlApi
-db.initialize()
-
-# etl.load_historical_generic_vix_futures_prices(_db=db)
-
-dataset = 'EUREX'
-futures_series = 'FVS'
-start_date = dt.datetime(2010, 1, 1)
-contract_range = np.arange(1, 9)
-_db = db
-
-data = qfl_data.QuandlApi.retrieve_historical_vstoxx_futures_prices(
-    start_date=start_date
-)
-
-etl.load_historical_futures_prices(
-    _db=db,
-    start_date=start_date,
-    futures_series=futures_series,
-    dataset=dataset
-)
-
-etl.ingest_historical_generic_futures_prices(
-    _db=db,
-    start_date=start_date,
-    futures_series='FVS',
-    source_series='EUREX_FVS',
-    contract_range=contract_range,
-    dataset='CHRIS'
-)
-
-# Get updated VIX futures data
-vix_data = qfl_data.QuandlApi.update_daily_futures_prices(
-    date=dt.datetime.today(),
-    dataset='CBOE',
-    futures_series='VX',
-    contract_range=np.arange(0, 10)
-)
-
-v2x_data = qfl_data.QuandlApi.update_daily_futures_prices(
-    date=dt.datetime.today(),
-    dataset='EUREX',
-    futures_series='FVS',
-    contract_range=np.arange(0, 10)
-)
-
-etl.update_futures_prices(_db=db,
-                          dataset='EUREX',
-                          futures_series='FVS',
-                          contract_range=np.arange(0,10))
-
-futures_data = v2x_data
-futures_series = 'FVS'
-_db = db
-
-futures_data['open_interest'] = \
-    futures_data['Prev. Day Open Interest']
-
-# Map to appropriate contact
-series_data = _db.get_futures_series(futures_series=futures_series)
-series_id = series_data['id'].values[0]
-
-where_str = " series_id = " + str(series_id) \
-            + " and maturity_date >= '" + dt.datetime.today().date().__str__() + "'"
-
-futures_contracts_data = _db.get_data(
-    table_name='futures_contracts',
-    where_str=where_str)
-
-futures_data = futures_data.reset_index()
-
-df = pd.merge(left=futures_contracts_data[['series_id', 'ticker']],
-              right=futures_data,
-              on='ticker')
-cols = ['series_id', 'date', 'close_price', 'high_price', 'low_price',
-        'open_price', 'settle_price', 'volume', 'open_interest']
-cols = list(set(cols).intersection(set(df.columns)))
-
-df = df[cols]
 
 
 
+'''
+--------------------------------------------------------------------------------
+VIX versus skew
+--------------------------------------------------------------------------------
+'''
+start_date = dt.datetime(1990, 1, 1)
+skew = QuandlApi.get('CBOE/SKEW', start_date)
+vix = md.get_generic_index_prices('VIX', start_date)['last_price']
+vix.index = vix.index.get_level_values('date')
+data = pd.DataFrame(vix)
+data['SKEW'] = skew
+data = data.rename(columns={'last_price': 'VIX'})
+
+
+plt.scatter(data['VIX'][data.index >= dt.datetime(2010, 1, 1)],
+            data['SKEW'][data.index >= dt.datetime(2010, 1, 1)],
+            color='b')
+plt.scatter(data['VIX'].values[-1],
+            data['SKEW'].values[-1],
+            color='r')
+plt.ylabel('SKEW Index')
+plt.xlabel('VIX Index')
+plt.title('VIX versus SKEW, 2010-2016')
+plt.legend(['historical', 'live'])
+
+data = QuandlApi.get('CBOE/SKEW', etl.default_start_date).reset_index()
+s = "select id from generic_indices where ticker = 'SKEW'"
+id = db.read_sql(s).iloc[0].values[0]
+data['id'] = id
+data = data.rename(columns={'SKEW': 'last_price'})
+db.execute_db_save(df=data,
+                   table=table,
+                   extra_careful=False,
+                   time_series=True)
+
+'''
+--------------------------------------------------------------------------------
+Barchart
+--------------------------------------------------------------------------------
+'''
 
 import barchart
 barchart.API_KEY = '5c45079e0956acbcf33925204ee4846a'
-
-
 
 import urllib2
 import simplejson as json
@@ -488,178 +1037,11 @@ print(quote) # quote is a dict
 
 
 
-# note codes for VIX futures positioning
-# CFTC/TIFF_CBOE_VX_ALL
-
-#############################################################################
-# Database stuff
-#############################################################################
-
-
-reload(etl)
-reload(qfl_data)
-from qfl.core.database_interface import DatabaseInterface as db
-
-# Database stuff
-db.initialize()
-
-
-
-
-etl.daily_equity_price_ingest()
-
-date = utils.closest_business_day()
-data_source = 'yahoo'
-
-etl.ingest_historical_equity_prices(ids=None,
-                                    start_date=etl.default_start_date,
-                                    end_date=date,
-                                    data_source=data_source,
-                                    _db=db)
-
-equities, equity_prices_table, ids, equity_tickers, rows = \
-    etl._prep_equity_price_ingest(ids=None, _db=db)
-
-
-etl.update_equity_prices(ids=None, data_source_name='yahoo', _db=db)
-print('done!')
-
-
-
-_id = ids[0]
-etl._ingest_historical_equity_prices(_id,
-                                     start_date=date,
-                                     end_date=date,
-                                     data_source_name='yahoo',
-                                     _db=db)
-
-
-
-id_ = 3642
-etl.update_option_prices_one(id_=id_, db=db)
-
-ids = [3642, 3643]
-etl.update_option_prices(ids, 'yahoo', db)
-
-etl._ingest_historical_equity_prices(_id=3642,
-                                     start_date=None,
-                                     end_date=None,
-                                     data_source_name='yahoo',
-                                     _db=db)
-
-# Test load of options prices from yahoo
-start_date = dt.datetime(1990, 1, 1)
-end_date = dt.datetime.today()
-
-options_table = db.get_table(table_name='equity_options')
-
-tmp = YahooApi.retrieve_options_data('ABBV')
-raw_data = tmp[0]
-unique_symbols = np.unique(raw_data.index.get_level_values(level='Symbol'))
-unique_symbols = [str(symbol) for symbol in unique_symbols]
-
-# Load attributes
-option_attributes = pd.DataFrame(raw_data.index.get_level_values(level='Symbol'))
-option_attributes = option_attributes.rename(columns={'Symbol': 'ticker'})
-option_attributes['option_type'] = raw_data.index.get_level_values(
-    level='Type')
-option_attributes['strike_price'] = raw_data.index.get_level_values(
-    level='Strike')
-option_attributes['maturity_date'] = raw_data.index.get_level_values(
-    level='Expiry')
-option_attributes['underlying_id'] = db.get_equity_ids(
-    equity_tickers=raw_data['Underlying'])
-
-db.execute_db_save(df=option_attributes,
-                   table=options_table,
-                   use_column_as_key='ticker')
-
-
-# Get their ID's
-t = tuple([str(ticker) for ticker in option_attributes['ticker']])
-q = 'select ticker, id from equity_options where ticker in {0}'.format(t)
-ticker_id_map = db.read_sql(query=q)
-ticker_id_map.index = ticker_id_map['ticker']
-
-option_prices_table = db.get_table(table_name='equity_option_prices')
-
-# Load prices
-option_prices = pd.DataFrame(columns=['date'])
-option_prices['date'] = raw_data['Quote_Time'].dt.date
-option_prices['quote_time'] = raw_data['Quote_Time'].dt.time
-option_prices['last_price'] = raw_data['Last']
-option_prices['bid_price'] = raw_data['Bid']
-option_prices['ask_price'] = raw_data['Ask']
-option_prices['iv'] = raw_data['IV']
-option_prices['volume'] = raw_data['Vol']
-option_prices['open_interest'] = raw_data['Open_Int']
-option_prices['spot_price'] = raw_data['Underlying_Price']
-option_prices['iv'] = option_prices['iv'].str.replace('%', '')
-option_prices['iv'] = option_prices['iv'].astype(float) / 100.0
-
-ids = ticker_id_map.loc[option_attributes['ticker'], 'id']
-option_prices = option_prices.reset_index()
-option_prices['id'] = ids.values
-
-db.execute_db_save(df=option_prices,
-                   table=option_prices_table)
-
-
-
-
-
-
-
-# Testing archive of historical prices
-
-equities = db.get_data(table_name='equities', index_table=True)
-ids = equities.index.tolist()
-
-rows = equities.loc[ids].reset_index()
-equity_tickers = rows['ticker'].tolist()
-equity_tickers = [str(ticker) for ticker in equity_tickers]
-
-equity_tickers = equity_tickers[0:1]
-
-ids = db.get_equity_ids(equity_tickers)
-
-date = qfl.utilities.basic_utilities.closest_business_day()
-
-expiry_dates, links = pdata.YahooOptions('ABBV') \
-    ._get_expiry_dates_and_links()
-
-data = pdata.YahooOptions('ABBV').get_near_stock_price(
-    above_below=20, expiry=expiry_dates[0])
-
-def hello(c):
-    c.drawString(100, 100, "Hello World")
-
-# Create a canvas
-c = canvas.Canvas(filename="hello.pdf",
-                  pagesize=letter,
-                  bottomup=1,
-                  pageCompression=0,
-                  verbosity=0,
-                  encrypt=None)
-width, height = letter
-
-# Draw some stuff
-
-
-hello(c)
-c.showPage()
-c.save()
-
-
-# FIGI identifiers - cool!
-api_key = "471197f1-50fe-429b-9e11-a6828980e213"
-req_data = [{"idType":"TICKER","idValue":"YHOO","exchCode":"US"}]
-r = requests.post('https://api.openfigi.com/v1/mapping',
-                  headers={"Content-Type": "text/json",
-                           "X-OPENFIGI-APIKEY": api_key},
-                  json=req_data)
-
-
+'''
+--------------------------------------------------------------------------------
+PYMC
+--------------------------------------------------------------------------------
+'''
 
 
 lib.plot_invgamma(a=12, b=1)

@@ -11,7 +11,8 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 import struct
 
-import qfl.utilities.basic_utilities as bu
+import qfl.utilities.basic_utilities as utils
+import qfl.utilities.statistics as stats
 
 default_start_date = dt.datetime(1980, 1, 1)
 
@@ -518,17 +519,17 @@ def prepare_nonparametric_analysis(capped_volatility_lead=None,
 
         # Run nonparametric analysis
         bandwidth = 1
-        predGrid = bu.npreg(depVar,
-                            indVar,
-                            out_grid,
-                            bandwidth,
-                            npd['TimeWeights'].values)
+        predGrid = stats.npreg(depVar,
+                               indVar,
+                               out_grid,
+                               bandwidth,
+                               npd['TimeWeights'].values)
         bandwidth = 1.5
-        predGrid_res = bu.npreg(depVar_res,
-                                indVar,
-                                out_grid,
-                                bandwidth,
-                                npd['TimeWeights'].values)
+        predGrid_res = stats.npreg(depVar_res,
+                                   indVar,
+                                   out_grid,
+                                   bandwidth,
+                                   npd['TimeWeights'].values)
 
         # Get interpolation
         f = interpolate.interp2d(x, y, predGrid, kind='linear')

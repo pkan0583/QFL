@@ -5,7 +5,6 @@ Created on Sun Jan 03 13:02:07 2016
 import datetime as dt
 import pandas as pd
 import numpy as np
-from dateutil import parser
 from workalendar.europe import EuropeanCentralBank, Germany, UnitedKingdom, \
     France, Sweden, Switzerland, Spain, Italy
 from workalendar.america import Brazil, Mexico, Chile
@@ -13,8 +12,28 @@ from workalendar.usa import UnitedStates
 from workalendar.asia import SouthKorea, Japan, Taiwan
 from workalendar.oceania import Australia
 from pandas.tseries.offsets import CustomBusinessDay
+import qfl.core.constants as constants
+import logging
+from logging.config import dictConfig
 
-    
+logging_config = (dict(
+    version=1,
+    formatters={
+        'f': {'format':
+              '%(asctime)s %(name)-12s %(levelname)-8s %(message)s'}
+        },
+    handlers={
+        'h': {'class': 'logging.StreamHandler',
+              'formatter': 'f',
+              'level': logging.INFO}
+        },
+    root={
+        'handlers': ['h'],
+        'level': logging.INFO,
+        },
+))
+
+
 def find(a, func):
     return [i for (i, val) in enumerate(a) if func(val)]
 
@@ -28,11 +47,26 @@ def is_iterable(x=None):
         return True
 
 
+def replace_nan_with_none(df=None):
+    df = df.where((pd.notnull(df)), None)
+    return df
+
 """
 -------------------------------------------------------------------------------
 BUSINESS DATE AND CALENDAR UTILITIES
 -------------------------------------------------------------------------------
 """
+
+
+def get_futures_month_from_code(month_codes=None):
+
+    if isinstance(month_codes, str):
+        futures_months = constants.futures_month_codes\
+                             .values().index(month_codes) + 1
+    else:
+        futures_months = [get_futures_month_from_code(code)
+                          for code in month_codes]
+    return futures_months
 
 
 class DateUtils(object):
@@ -110,6 +144,17 @@ class DateUtils(object):
         return holiday_list
 
     @classmethod
+    def get_business_date_range(cls,
+                                start_date=None,
+                                end_date=dt.datetime.today(),
+                                calendar_name=default_calendar):
+        bday = cls.get_bday(calendar_name)
+        dates = pd.DataFrame(pd.date_range(start_date, end_date))
+        dates.index = dates[0]
+        dates = dates.asfreq(bday).index
+        return dates
+
+    @classmethod
     def is_business_day(cls,
                         date=None,
                         calendar_name=default_calendar):
@@ -157,10 +202,10 @@ class DateUtils(object):
                     calendar_name=default_calendar):
 
         if isinstance(start_date, pd.Series):
-            start_date = start_date.values.tolist()
+            start_date = start_date.values
 
         if isinstance(end_date, pd.Series):
-            end_date = end_date.values.tolist()
+            end_date = end_date.values
 
         my_bday = cls.get_bday(calendar_name)
 
@@ -184,7 +229,7 @@ class DateUtils(object):
 
         for i in range(0, len(df)):
             df.loc[i, 'net_workdays'] = len(dates[df.loc[i, 'start_date']
-                                                 :df.loc[i, 'end_date']])
+                                                 :df.loc[i, 'end_date']])-1
 
         if len(df) == 1:
             return df['net_workdays'].values[0].tolist()
@@ -210,3 +255,9 @@ def closest_business_day(date=None,
                          calendar_name=DateUtils.default_calendar):
 
     return DateUtils.closest_business_day(date, prev, calendar_name)
+
+
+def is_after_time(hour=None, minute=None):
+
+    t = dt.time(hour, minute)
+    return dt.datetime.today() > t

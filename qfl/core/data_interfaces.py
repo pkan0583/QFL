@@ -5,11 +5,11 @@ import pandas_datareader.data as pdata
 from pandas.tseries.offsets import BDay
 import quandl as ql
 import numpy as np
-import sqlalchemy as sa
 import urllib
 import dateutil
 import time
-from sqlalchemy.sql.expression import bindparam
+import zipfile
+import csv
 from bs4 import BeautifulSoup
 import requests
 import logging
@@ -644,6 +644,217 @@ class QuandlApi(ExternalDataApi):
         raise NotImplementedError
 
     @staticmethod
+    def get_futures_metadata():
+
+        df = pd.DataFrame(columns=['futures_series',
+                                   'contracts_dataset',
+                                   'generic_dataset',
+                                   'contracts_series',
+                                   'generic_series',
+                                   'start_date'])
+
+        sd = dt.datetime(1990, 1, 1)
+
+        df.loc[0] = ['SP', 'CME', 'CHRIS', 'SP', 'CME_SP', sd]
+        df.loc[1] = ['ES', 'CME', 'CHRIS', 'ES', 'CME_ES', sd]
+        df.loc[2] = ['CL', 'CME', 'CHRIS', 'CL', 'CME_CL', sd]
+        df.loc[3] = ['BB', 'CME', 'CHRIS', 'BB', 'CME_BB', sd]
+        df.loc[4] = ['GC', 'CME', 'CHRIS', 'GC', 'CME_GC', sd]
+        df.loc[5] = ['SI', 'CME', 'CHRIS', 'SI', 'CME_SI', sd]
+        df.loc[6] = ['NG', 'CME', 'CHRIS', 'NG', 'CME_NG', sd]
+        df.loc[7] = ['ED', 'CME', 'CHRIS', 'ED', 'CME_ED', sd]
+        df.loc[8] = ['EC', 'CME', 'CHRIS', 'EC', 'CME_EC', sd]
+        df.loc[9] = ['JY', 'CME', 'CHRIS', 'JY', 'CME_JY', sd]
+        df.loc[10] = ['VX', 'CBOE', 'CHRIS', 'VX', 'CBOE_VX', sd]
+        df.loc[11] = ['FVS', 'EUREX', 'CHRIS', 'FVS', 'EUREX_FVS', sd]
+
+        return df
+
+    @staticmethod
+    def get_orats_data_from_api(tickers=None, start_date=None, end_date=None):
+
+        quandl_tickers = ['OPT/' + ticker for ticker in tickers]
+
+        data = QuandlApi.get_data(quandl_tickers, start_date, end_date)
+
+        data = data.reset_index()
+        col_map = QuandlApi.get_orats_column_map()
+
+        for i in range(0, len(col_map)):
+            col = col_map.iloc[i]['orats_col_name']
+            qfl_col = col_map.iloc[i]['qfl_col_name']
+            data = data.rename(columns={col: qfl_col})
+            if not (col == 'ticker' or col == 'date'):
+                data[qfl_col] = pd.to_numeric(data[qfl_col])
+
+        data['date'] = pd.to_datetime(data['date'])
+        data['ticker'] = data['ticker'].str.replace('OPT/', '')
+
+        return data
+
+    @staticmethod
+    def get_optionworks_data(full_history=False):
+
+        url = "https://www.quandl.com/api/v3/databases/OWF/data?api_key="
+        url += ql.ApiConfig.api_key
+        if not full_history:
+            url += "&download_type=partial"
+
+        zip_filename = "data/temp_fw_update.zip"
+        filename_ivm = "data/OWF_history_ivm.csv"
+        filename_ivs = "data/OWF_history_ivs.csv"
+
+        urllib.urlretrieve(url, zip_filename)
+        z = zipfile.ZipFile(zip_filename)
+        z_open = z.open(z.filelist[0].filename)
+        reader = csv.reader(z_open)
+
+        # These are in the OptionWorks raw format
+        col_ivm = QuandlApi.get_optionworks_ivm_cols()
+        col_ivs = QuandlApi.get_optionworks_ivs_cols()
+
+        # Mapping to lowercase is better for Postgres
+        col_ivm = [col.lower() for col in col_ivm]
+        col_ivs = [col.lower() for col in col_ivs]
+
+        # Create or open the target CSV files
+        csvfile_ivm = open(filename_ivm, 'w')
+        csvfile_ivs = open(filename_ivs, 'w')
+
+        # Writers to generate the target CSV files
+        writer_ivm = csv.writer(csvfile_ivm)
+        writer_ivs = csv.writer(csvfile_ivs)
+
+        # Write headers
+        writer_ivm.writerow(col_ivm)
+        writer_ivs.writerow(col_ivs)
+
+        # Iterate through rows and separate the two CSV files
+        for row in reader:
+            quandl_code = row[0]
+            if quandl_code[-1] == 'M':
+                writer_ivm.writerow(row)
+            elif quandl_code[-1] == 'S':
+                writer_ivs.writerow(row)
+
+        csvfile_ivm.flush()
+        csvfile_ivs.flush()
+
+        csvfile_ivm.close()
+        csvfile_ivs.close()
+
+        data_ivm = pd.read_csv(filename_ivm)
+        data_ivs = pd.read_csv(filename_ivs)
+
+        data_ivm['date'] = pd.to_datetime(data_ivm['date'])
+        data_ivs['date'] = pd.to_datetime(data_ivs['date'])
+
+        return data_ivm, data_ivs
+
+    @staticmethod
+    def get_optionworks_ivm_cols():
+
+        cols = ['Code',
+                'Date',
+                'Future',
+                'AtM',
+                'RR25',
+                'RR10',
+                'Fly25',
+                'Fly10',
+                'Beta1',
+                'Beta2',
+                'Beta3',
+                'Beta4',
+                'Beta5',
+                'Beta6',
+                'MinMoney',
+                'MaxMoney',
+                'DtE',
+                'DtT']
+
+        return cols
+
+    @staticmethod
+    def get_optionworks_ivs_cols():
+
+        cols = ['Code',
+                   'Date',
+                   'DNSvol',
+                   'P01dVol',
+                   'P05dVol',
+                   'P10dVol',
+                   'P15dVol',
+                   'P20dVol',
+                   'P25dVol',
+                   'P30dVol',
+                   'P35dVol',
+                   'P40dVol',
+                   'P45dVol',
+                   'P50dVol',
+                   'P55dVol',
+                   'P60dVol',
+                   'P65dVol',
+                   'P70dVol',
+                   'P75dVol',
+                   'P80dVol',
+                   'P85dVol',
+                   'P90dVol',
+                   'P95dVol',
+                   'P99dVol',
+                   'C01dVol',
+                   'C05dVol',
+                   'C10dVol',
+                   'C15dVol',
+                   'C20dVol',
+                   'C25dVol',
+                   'C30dVol',
+                   'C35dVol',
+                   'C40dVol',
+                   'C45dVol',
+                   'C50dVol',
+                   'C55dVol',
+                   'C60dVol',
+                   'C65dVol',
+                   'C70dVol',
+                   'C75dVol',
+                   'C80dVol',
+                   'C85dVol',
+                   'C90dVol',
+                   'C95dVol',
+                   'C99dVol',
+                   'DtE']
+
+        return cols
+
+    @staticmethod
+    def get_orats_data(full_history=False):
+
+        url = "https://www.quandl.com/api/v3/databases/OPT/data?api_key="
+        url += ql.ApiConfig.api_key
+        if not full_history:
+            url += "&download_type=partial"
+
+        urllib.urlretrieve(url, "data/temp_orats_update.zip")
+        z = zipfile.ZipFile("data/temp_orats_update.zip")
+
+        data = pd.read_csv(z.open(z.filelist[0].filename), header=None)
+
+        col_map = QuandlApi.get_orats_column_map()
+
+        for i in range(0, len(col_map)):
+            data = data.rename(columns={i: col_map.iloc[i]['qfl_col_name']})
+
+        data['date'] = pd.to_datetime(data['date'])
+
+        return data
+
+    @staticmethod
+    def get_orats_column_map():
+        column_map = pd.read_excel("data/orats_column_map.xlsx")
+        return column_map
+
+    @staticmethod
     def get_equity_index_universe():
         return ['DOW', 'SPX', 'NDX_C', 'NDX', 'UKX']
 
@@ -719,7 +930,7 @@ class QuandlApi(ExternalDataApi):
         return raw_data
 
     @staticmethod
-    def get_data(tickers=None, start_date=None, end_date=dt.datetime.today()):
+    def get_data(tickers=None, start_date=None, end_date=None):
 
         """
         The idea here is to automatically figure out what fields Quandl is
@@ -729,6 +940,9 @@ class QuandlApi(ExternalDataApi):
         :param end_date:
         :return:
         """
+
+        if end_date is None:
+            end_date = dt.datetime.today()
 
         # Quandl API call
         raw_data = ql.get(tickers,
@@ -748,7 +962,7 @@ class QuandlApi(ExternalDataApi):
         del data['ticker']
         del data['date']
         del data['field']
-        data = data.unstack('field')
+        data = data.unstack('field')[0]
 
         return data
 
@@ -773,10 +987,9 @@ class QuandlApi(ExternalDataApi):
 
         # Obnoxious, need to manage this stuff somewhere
         date_field = 'Date'
-        if dataset in ('CHRIS', 'CBOE'):
-            date_field = 'Trade Date'
-        if dataset == 'CHRIS' and futures_series == 'FVS':
-            date_field = 'Date'
+        if dataset == 'CBOE' \
+            or source_series[0:min(len(source_series), 4)] == "CBOE":
+                date_field = 'Trade Date'
 
         generic_ticker_range = contract_range
         generic_tickers_short = [futures_series + str(i)
@@ -789,10 +1002,16 @@ class QuandlApi(ExternalDataApi):
         for ticker in generic_tickers:
             try:
                 tmp = ql.get(ticker, start_date=start_date)
+                logging.info(ticker + " success...")
             except:
+                logging.info(ticker + " failure...")
                 continue
 
             tmp['ticker'] = generic_tickers_short[i]
+
+            if len(tmp) == 0:
+                continue
+
             tmp = tmp[np.isfinite(tmp['Settle'])]
             tmp = tmp.reset_index()
             tmp.index = [tmp['ticker'], tmp[date_field]]
@@ -908,11 +1127,19 @@ class QuandlApi(ExternalDataApi):
     @staticmethod
     def retrieve_historical_futures_prices(start_date=None,
                                            dataset=None,
-                                           futures_series=None):
+                                           futures_series=None,
+                                           contract_months_list=None):
 
         date_field = 'Date'
         if dataset == 'CBOE':
             date_field = 'Trade Date'
+
+        if contract_months_list is None:
+            contract_months = constants.futures_month_codes
+        elif not isinstance(contract_months_list, dict):
+            m = utils.get_futures_month_from_code(contract_months_list)
+            contract_months = dict((m[i], contract_months_list[i])
+                                   for i in range(0, len(contract_months_list)))
 
         years = np.arange(start_date.year, dt.datetime.today().year + 2)
 
@@ -920,19 +1147,22 @@ class QuandlApi(ExternalDataApi):
         futures_tickers = list()
         futures_tickers_df = pd.DataFrame(columns=['year', 'month'])
         for year in years:
-            for month in constants.futures_month_codes:
+            for month in contract_months:
 
-                short_ticker = futures_series + constants.futures_month_codes[
+                short_ticker = futures_series + contract_months[
                     month] + str(year)
                 ticker = dataset + "/" + futures_series \
-                         + constants.futures_month_codes[month] + str(year)
+                    + contract_months[month] + str(year)
                 futures_tickers.append(ticker)
                 futures_tickers_df.loc[ticker, 'year'] = year
                 futures_tickers_df.loc[ticker, 'month'] = month
 
+                logging.info(short_ticker)
+
                 try:
                     tmp = ql.get(ticker)
                 except:
+                    logging.info('failed!')
                     continue
 
                 tmp['ticker'] = short_ticker
@@ -963,7 +1193,7 @@ class QuandlApi(ExternalDataApi):
         if 'ticker' in tickers_file:
             tickers = tickers_file['ticker'].values
         else:
-            tickers=tickers_file
+            tickers = tickers_file
         return tickers
 
 '''
@@ -1195,15 +1425,101 @@ DATA SCRAPER
 class DataScraper(object):
 
     @staticmethod
-    def update_vix_settle_price(overwrite_date=None):
+    def retrieve_uk_yield_curve():
 
-        # temp filename to use
-        filename = "data/vix_settle.csv"
+        burl = 'http://www.bankofengland.co.uk/statistics/Documents/yieldcurve/'
+        url1 = burl + 'ukois16_mdaily.xlsx'
+        url2 = burl + 'ukois09_mdaily.xlsx'
+
+        yc1 = pd.read_excel(url1, sheetname="2. spot curve", skiprows=2)
+        yc1 = yc1.drop(yc1.index[0:3])
+
+        yc2 = pd.read_excel(url2, sheetname="2. spot curve", skiprows=2)
+        yc2 = yc2.drop(yc2.index[0:3])
+
+        data = yc1.append(yc2)\
+            .rename(columns={'months:':'date'})\
+            .set_index('date', drop=True)\
+            .sort_index()
+
+        # Standardize interest rates
+        data /= 100.0
+
+        return data
+
+    @staticmethod
+    def retrieve_cftc_commodity_positioning_data(full_history=False,
+                                                 year=2016):
+
+        update_filename = 'fut_disagg_xls_' + str(year) + '.zip'
+        update_data = DataScraper._retrieve_cftc_positioning_data(
+            filename=update_filename)
+
+        if full_history:
+            history_filename = 'fut_disagg_xls_hist_2006_2015.zip'
+
+            history_data = DataScraper._retrieve_cftc_positioning_data(
+                filename=history_filename)
+
+            update_data = update_data.append(history_data)
+
+        return update_data
+
+    @staticmethod
+    def retrieve_cftc_financial_positioning_data(full_history=False,
+                                                 year=2016):
+
+        update_filename = 'fut_fin_xls_' + str(year) + '.zip'
+        update_data = DataScraper._retrieve_cftc_positioning_data(
+            filename=update_filename)
+
+        if full_history:
+            history_filename = 'fut_fin_xls_hist_2006_2015.zip'
+
+            history_data = DataScraper._retrieve_cftc_positioning_data(
+                filename=history_filename)
+
+            update_data = update_data.append(history_data)
+
+        return update_data
+
+    @staticmethod
+    def _retrieve_cftc_positioning_data(filename=None):
+
+        base_url = 'http://www.cftc.gov/files/dea/history/'
+        temp_filename = "data/temp_cftc.zip"
+
+        url = base_url + filename
+        urllib.urlretrieve(url, temp_filename)
+
+        # Seems to crash in airflow without waiting
+        time.sleep(10)
+
+        z = zipfile.ZipFile(temp_filename)
+        data = pd.read_excel(z.open(z.filelist[0].filename))
+        os.remove(temp_filename)
+
+        return data
+
+    @staticmethod
+    def retrieve_vstoxx_historical_prices():
+
+        base_url = 'https://www.stoxx.com/document/Indices'
+        url = base_url + '/Current/HistoricalData/h_v2tx.txt'
+        data = pd.read_table(url, sep=';')
+        data['Date'] = pd.to_datetime(data['Date'])
+        data['Symbol'] = 'V2X'
+        data = data.rename(columns={'Date': 'date',
+                                    'Symbol': 'ticker',
+                                    'Indexvalue': 'last_price'})
+        return data
+
+    @staticmethod
+    def update_vix_settle_price(overwrite_date=None):
 
         # URL for daily settle prices
         url = "http://cfe.cboe.com/data/DailyVXFuturesEODValues/DownloadFS.aspx"
-        urllib.urlretrieve(url, filename)
-        data = pd.read_csv(filename + ".csv")
+        data = pd.read_csv(url)
 
         data = data.reset_index()
 
@@ -1216,7 +1532,6 @@ class DataScraper(object):
         prices = pd.DataFrame(index=included_indices,
                               columns=['date', 'maturity_date', 'settle_price'])
 
-        date = utils.workday(dt.datetime.today(), -1)
         if overwrite_date is not None:
             date = overwrite_date
 

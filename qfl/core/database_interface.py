@@ -312,6 +312,30 @@ class DatabaseInterface(object):
             sa.ForeignKeyConstraint(['id'], ['equity_indices.index_id']))
         cls.tables['equity_index_prices'] = equity_index_prices_table
 
+        # GENERIC INDICES
+        generic_indices_table = sa.Table(
+            'generic_indices', cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('ticker', sa.String(16), unique=True),
+            sa.Column('name', sa.String(128), unique=True),
+            sa.Column('currency', sa.String(16))
+        )
+        cls.tables['generic_indices'] = generic_indices_table
+
+        # GENERIC INDEX PRICES
+        generic_index_prices_table = sa.Table(
+            'generic_index_prices', cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('adj_close', sa.Float, primary_key=False),
+            sa.Column('last_price', sa.Float, primary_key=False),
+            sa.Column('open_price', sa.Float, primary_key=False),
+            sa.Column('high_price', sa.Float, primary_key=False),
+            sa.Column('low_price', sa.Float, primary_key=False),
+            sa.Column('volume', sa.Float, primary_key=False),
+            sa.ForeignKeyConstraint(['id'], ['generic_indices.id']))
+        cls.tables['generic_index_prices'] = generic_index_prices_table
+
         # EQUITIES
         equities_table = sa.Table(
             'equities', cls.metadata,
@@ -411,7 +435,10 @@ class DatabaseInterface(object):
             sa.Column('units', sa.String(128), primary_key=False),
             sa.Column('point_value', sa.Float, primary_key=False),
             sa.Column('tick_value', sa.Float, primary_key=False),
-            sa.Column('delivery_months', sa.String(16), primary_key=False)
+            sa.Column('trading_times', sa.String),
+            sa.Column('start_date', sa.Date),
+            sa.Column('delivery_months', sa.String(16), primary_key=False),
+            sa.Column('cftc_code', sa.String(16), primary_key=False)
         )
         cls.tables['futures_series'] = futures_series_table
 
@@ -441,6 +468,7 @@ class DatabaseInterface(object):
             sa.Column('close_price', sa.Float, primary_key=False),
             sa.Column('high_price', sa.Float, primary_key=False),
             sa.Column('low_price', sa.Float, primary_key=False),
+            sa.Column('seasonality_adj_price', sa.Float, primary_key=False),
             sa.Column('open_interest', sa.Integer, primary_key=False),
             sa.Column('volume', sa.Integer, primary_key=False),
             sa.Column('days_to_maturity', sa.Integer, primary_key=False),
@@ -474,12 +502,265 @@ class DatabaseInterface(object):
             sa.Column('close_price', sa.Float, primary_key=False),
             sa.Column('high_price', sa.Float, primary_key=False),
             sa.Column('low_price', sa.Float, primary_key=False),
+            sa.Column('seasonality_adj_price', sa.Float, primary_key=False),
             sa.Column('open_interest', sa.Integer, primary_key=False),
             sa.Column('volume', sa.Integer, primary_key=False),
+            sa.Column('futures_contract_id', sa.Integer, primary_key=False),
             sa.Column('days_to_maturity', sa.Integer, primary_key=False),
             sa.ForeignKeyConstraint(['id'], ['generic_futures_contracts.id'])
         )
         cls.tables['generic_futures_prices'] = generic_futures_prices_table
+
+        # CONSTANT MATURITY FUTURES PRICES
+        constant_maturity_futures_prices_table = sa.Table(
+            'constant_maturity_futures_prices', cls.metadata,
+            sa.Column('series_id', sa.Integer, primary_key=True),
+            sa.Column('days_to_maturity', sa.Integer, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('price', sa.Float),
+            sa.ForeignKeyConstraint(['series_id'], ['futures_series.id'])
+        )
+        cls.tables['constant_maturity_futures_prices'] \
+            = constant_maturity_futures_prices_table
+
+        # STAGING TABLE FOR ORATS
+        orats_staging_table = sa.Table(
+            'staging_orats', cls.metadata,
+            sa.Column('ticker', sa.String(32), primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('underlying_price', sa.Float),
+            sa.Column('iv_1m', sa.Float),
+            sa.Column('iv_2m', sa.Float),
+            sa.Column('iv_3m', sa.Float),
+            sa.Column('iv_1mc', sa.Float),
+            sa.Column('days_to_maturity_1mc', sa.Float),
+            sa.Column('iv_2mc', sa.Float),
+            sa.Column('days_to_maturity_2mc', sa.Float),
+            sa.Column('iv_3mc', sa.Float),
+            sa.Column('days_to_maturity_3mc', sa.Float),
+            sa.Column('iv_4mc', sa.Float),
+            sa.Column('days_to_maturity_4mc', sa.Float),
+            sa.Column('skew', sa.Float),
+            sa.Column('curvature', sa.Float),
+            sa.Column('skew_inf', sa.Float),
+            sa.Column('curvature_inf', sa.Float),
+            sa.Column('rv_10d', sa.Float),
+            sa.Column('rv_20d', sa.Float),
+            sa.Column('rv_60d', sa.Float),
+            sa.Column('rv_120d', sa.Float),
+            sa.Column('rv_252d', sa.Float),
+            sa.Column('tick_rv_10d', sa.Float),
+            sa.Column('tick_rv_20d', sa.Float),
+            sa.Column('tick_rv_60d', sa.Float),
+            sa.Column('tick_rv_120d', sa.Float),
+            sa.Column('tick_rv_252d', sa.Float)
+        )
+        cls.tables['staging_orats'] = orats_staging_table
+
+        # STAGING TABLES FOR OPTIONWORKS
+        optionworks_ivm_staging_table = sa.Table(
+            'staging_optionworks_ivm', cls.metadata,
+            sa.Column('code', sa.String(64), primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('future', sa.Float),
+            sa.Column('atm', sa.Float),
+            sa.Column('rr25', sa.Float),
+            sa.Column('rr10', sa.Float),
+            sa.Column('fly25', sa.Float),
+            sa.Column('fly10', sa.Float),
+            sa.Column('beta1', sa.Float),
+            sa.Column('beta2', sa.Float),
+            sa.Column('beta3', sa.Float),
+            sa.Column('beta4', sa.Float),
+            sa.Column('beta5', sa.Float),
+            sa.Column('beta6', sa.Float),
+            sa.Column('minmoney', sa.Float),
+            sa.Column('maxmoney', sa.Float),
+            sa.Column('dte', sa.Float),
+            sa.Column('dtt', sa.Float))
+        cls.tables['staging_optionworks_ivm'] = optionworks_ivm_staging_table
+
+        optionworks_ivs_staging_table = sa.Table(
+            'staging_optionworks_ivs', cls.metadata,
+            sa.Column('code', sa.String(64), primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('dnsvol', sa.Float),
+            sa.Column('p01dvol', sa.Float),
+            sa.Column('p05dvol', sa.Float),
+            sa.Column('p10dvol', sa.Float),
+            sa.Column('p15dvol', sa.Float),
+            sa.Column('p20dvol', sa.Float),
+            sa.Column('p25dvol', sa.Float),
+            sa.Column('p30dvol', sa.Float),
+            sa.Column('p35dvol', sa.Float),
+            sa.Column('p40dvol', sa.Float),
+            sa.Column('p45dvol', sa.Float),
+            sa.Column('p50dvol', sa.Float),
+            sa.Column('p55dvol', sa.Float),
+            sa.Column('p60dvol', sa.Float),
+            sa.Column('p65dvol', sa.Float),
+            sa.Column('p70dvol', sa.Float),
+            sa.Column('p75dvol', sa.Float),
+            sa.Column('p80dvol', sa.Float),
+            sa.Column('p85dvol', sa.Float),
+            sa.Column('p90dvol', sa.Float),
+            sa.Column('p95dvol', sa.Float),
+            sa.Column('p99dvol', sa.Float),
+            sa.Column('c01dvol', sa.Float),
+            sa.Column('c05dvol', sa.Float),
+            sa.Column('c10dvol', sa.Float),
+            sa.Column('c15dvol', sa.Float),
+            sa.Column('c20dvol', sa.Float),
+            sa.Column('c25dvol', sa.Float),
+            sa.Column('c30dvol', sa.Float),
+            sa.Column('c35dvol', sa.Float),
+            sa.Column('c40dvol', sa.Float),
+            sa.Column('c45dvol', sa.Float),
+            sa.Column('c50dvol', sa.Float),
+            sa.Column('c55dvol', sa.Float),
+            sa.Column('c60dvol', sa.Float),
+            sa.Column('c65dvol', sa.Float),
+            sa.Column('c70dvol', sa.Float),
+            sa.Column('c75dvol', sa.Float),
+            sa.Column('c80dvol', sa.Float),
+            sa.Column('c85dvol', sa.Float),
+            sa.Column('c90dvol', sa.Float),
+            sa.Column('c95dvol', sa.Float),
+            sa.Column('c99dvol', sa.Float))
+        cls.tables['staging_optionworks_ivs'] = optionworks_ivs_staging_table
+
+        # OPTIONWORKS
+
+        futures_series_identifiers_table = sa.Table(
+            'futures_series_identifiers', cls.metadata,
+            sa.Column('source', sa.String(64), primary_key=True),
+            sa.Column('source_id', sa.String(64), primary_key=True),
+            sa.Column('series_id', sa.Integer, nullable=False)
+        )
+        cls.tables['futures_series_identifiers'] \
+            = futures_series_identifiers_table
+
+        optionworks_codes_table = sa.Table(
+            'optionworks_codes', cls.metadata,
+            sa.Column('ow_code', sa.String(64), primary_key=True),
+            sa.Column('ow_data_type', sa.String(8), nullable=False),
+            sa.Column('maturity_type', sa.String(32), nullable=False),
+            sa.Column('exchange_code', sa.String(32), nullable=False),
+            sa.Column('futures_series', sa.String(32), nullable=False),
+            sa.Column('option', sa.String(32), nullable=False),
+            sa.Column('futures_contract', sa.String(32)),
+            sa.Column('days_to_maturity', sa.Integer))
+        cls.tables['optionworks_codes'] = optionworks_codes_table
+
+        futures_ivol_fixed_maturity_by_delta_table = sa.Table(
+            'futures_ivol_fixed_maturity_by_delta', cls.metadata,
+            sa.Column('series_id', sa.Integer, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('futures_contract', sa.String(32), primary_key=True),
+            sa.Column('option_type', sa.String(16), primary_key=True),
+            sa.Column('ivol_01d', sa.Float),
+            sa.Column('ivol_05d', sa.Float),
+            sa.Column('ivol_10d', sa.Float),
+            sa.Column('ivol_15d', sa.Float),
+            sa.Column('ivol_20d', sa.Float),
+            sa.Column('ivol_25d', sa.Float),
+            sa.Column('ivol_30d', sa.Float),
+            sa.Column('ivol_35d', sa.Float),
+            sa.Column('ivol_40d', sa.Float),
+            sa.Column('ivol_45d', sa.Float),
+            sa.Column('ivol_50d', sa.Float),
+            sa.Column('ivol_55d', sa.Float),
+            sa.Column('ivol_60d', sa.Float),
+            sa.Column('ivol_65d', sa.Float),
+            sa.Column('ivol_70d', sa.Float),
+            sa.Column('ivol_75d', sa.Float),
+            sa.Column('ivol_80d', sa.Float),
+            sa.Column('ivol_85d', sa.Float),
+            sa.Column('ivol_90d', sa.Float),
+            sa.Column('ivol_95d', sa.Float),
+            sa.Column('ivol_99d', sa.Float),
+        )
+        cls.tables['futures_ivol_fixed_maturity_by_delta'] \
+            = futures_ivol_fixed_maturity_by_delta_table
+
+        futures_ivol_constant_maturity_by_delta_table = sa.Table(
+            'futures_ivol_constant_maturity_by_delta', cls.metadata,
+            sa.Column('series_id', sa.Integer, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('days_to_maturity', sa.Integer, primary_key=True),
+            sa.Column('option_type', sa.String(16), primary_key=True),
+            sa.Column('ivol_01d', sa.Float),
+            sa.Column('ivol_05d', sa.Float),
+            sa.Column('ivol_10d', sa.Float),
+            sa.Column('ivol_15d', sa.Float),
+            sa.Column('ivol_20d', sa.Float),
+            sa.Column('ivol_25d', sa.Float),
+            sa.Column('ivol_30d', sa.Float),
+            sa.Column('ivol_35d', sa.Float),
+            sa.Column('ivol_40d', sa.Float),
+            sa.Column('ivol_45d', sa.Float),
+            sa.Column('ivol_50d', sa.Float),
+            sa.Column('ivol_55d', sa.Float),
+            sa.Column('ivol_60d', sa.Float),
+            sa.Column('ivol_65d', sa.Float),
+            sa.Column('ivol_70d', sa.Float),
+            sa.Column('ivol_75d', sa.Float),
+            sa.Column('ivol_80d', sa.Float),
+            sa.Column('ivol_85d', sa.Float),
+            sa.Column('ivol_90d', sa.Float),
+            sa.Column('ivol_95d', sa.Float),
+            sa.Column('ivol_99d', sa.Float)
+        )
+        cls.tables['futures_ivol_constant_maturity_by_delta'] \
+            = futures_ivol_constant_maturity_by_delta_table
+
+        futures_ivol_fixed_maturity_surface_model_table = sa.Table(
+            'futures_ivol_fixed_maturity_surface_model', cls.metadata,
+            sa.Column('series_id', sa.Integer, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('futures_contract', sa.String(32), primary_key=True),
+            sa.Column('future', sa.Float),
+            sa.Column('atm', sa.Float),
+            sa.Column('rr25', sa.Float),
+            sa.Column('rr10', sa.Float),
+            sa.Column('fly25', sa.Float),
+            sa.Column('fly10', sa.Float),
+            sa.Column('beta1', sa.Float),
+            sa.Column('beta2', sa.Float),
+            sa.Column('beta3', sa.Float),
+            sa.Column('beta4', sa.Float),
+            sa.Column('beta5', sa.Float),
+            sa.Column('beta6', sa.Float),
+            sa.Column('minmoney', sa.Float),
+            sa.Column('maxmoney', sa.Float),
+            sa.Column('dte', sa.Float),
+            sa.Column('dtt', sa.Float))
+        cls.tables['futures_ivol_fixed_maturity_surface_model'] \
+            = futures_ivol_fixed_maturity_surface_model_table
+
+        futures_ivol_constant_maturity_surface_model_table = sa.Table(
+            'futures_ivol_constant_maturity_surface_model', cls.metadata,
+            sa.Column('series_id', sa.Integer, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('days_to_maturity', sa.Integer, primary_key=True),
+            sa.Column('future', sa.Float),
+            sa.Column('atm', sa.Float),
+            sa.Column('rr25', sa.Float),
+            sa.Column('rr10', sa.Float),
+            sa.Column('fly25', sa.Float),
+            sa.Column('fly10', sa.Float),
+            sa.Column('beta1', sa.Float),
+            sa.Column('beta2', sa.Float),
+            sa.Column('beta3', sa.Float),
+            sa.Column('beta4', sa.Float),
+            sa.Column('beta5', sa.Float),
+            sa.Column('beta6', sa.Float),
+            sa.Column('minmoney', sa.Float),
+            sa.Column('maxmoney', sa.Float),
+            sa.Column('dte', sa.Float),
+            sa.Column('dtt', sa.Float))
+        cls.tables['futures_ivol_constant_maturity_surface_model'] \
+            = futures_ivol_constant_maturity_surface_model_table
 
         # EXCHANGES
         exchanges_table = sa.Table(
@@ -500,6 +781,14 @@ class DatabaseInterface(object):
         )
         cls.tables['countries'] = countries_table
 
+        # YAHOO CODES
+        yfinance_metadata_table = sa.Table(
+            'yfinance_metadata', cls.metadata,
+            sa.Column('yahoo_code', sa.String(64), primary_key=True),
+            sa.Column('name', sa.String(128))
+        )
+        cls.tables['yfinance_metadata'] = yfinance_metadata_table
+
     @classmethod
     def create_tables(cls):
         cls.metadata.create_all(cls.engine)
@@ -514,6 +803,9 @@ class DatabaseInterface(object):
 
     @classmethod
     def execute_bulk_insert(cls, df=None, table=None, batch_size=1000):
+
+        # Very first step: replace NaN with null
+        df = df.where((pd.notnull(df)), None)
 
         num_batches = int(np.ceil(float(len(df)) / batch_size))
         result = None
@@ -545,11 +837,23 @@ class DatabaseInterface(object):
         :param use_column_as_key string
         :param extra_careful bool
         :param delete_existing bool
+        :param time_series bool
         :return: none
         """
 
         logging.info('starting archive of '
                      + str(len(df)) + ' records')
+
+        logging.info(df.head(5))
+
+        # Very first step: replace NaN with null
+        df = df.where((pd.notnull(df)), None)
+
+        # Now blow up index
+        try:
+            df = df.reset_index()
+        except:
+            df = df.reset_index(drop=True)
 
         # Get where string to identify existing rows
         if extra_careful:
@@ -753,25 +1057,13 @@ class DatabaseInterface(object):
         return equities
 
     @classmethod
-    def get_futures_series(cls, futures_series=None):
+    def get_futures_series(cls, futures_series=None, exchange_code=None):
 
-        if utils.is_iterable(futures_series):
-            where_str = " series in {0}".format(tuple(futures_series))
-        else:
-            where_str = " series = '" + futures_series + "'"
+        where_str = " series in {0}".format(
+            DatabaseUtilities.format_as_tuple_for_query(futures_series))
+        if exchange_code is not None:
+            where_str += " and exchange in {0}".format(
+                DatabaseUtilities.format_as_tuple_for_query(exchange_code))
         futures_series_data = cls.get_data(table_name='futures_series',
                                            where_str=where_str)
-
-        # if utils.is_iterable(futures_series):
-        #     ind = futures_series_data.index[
-        #         futures_series_data['series'].isin(futures_series)]
-        # else:
-        #     ind = futures_series_data.index[
-        #         futures_series_data['series'] == futures_series]
-        #
-        # if len(ind) == 0:
-        #     raise LookupError('cannot find series!')
-        #
-        # futures_series_data = futures_series_data.loc[ind]
-
         return futures_series_data
