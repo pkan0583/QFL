@@ -12,8 +12,12 @@ import qfl.utilities.basic_utilities as utils
 from qfl.core.database_interface import DatabaseInterface as db
 from qfl.core.database_interface import DatabaseUtilities as dbutils
 
+from scipy.interpolate import interp1d
+
 market_data_date = utils.workday(dt.datetime.today(), num_days=-1)
 history_default_start_date = dt.datetime(2000, 1, 1)
+option_delta_grid = [1] + range(5, 95, 5) + [99]
+
 db.initialize()
 
 
@@ -35,6 +39,76 @@ def get_futures_calendar_name(futures_series=None):
 SECURITIES UNIVERSES
 -------------------------------------------------------------------------------
 """
+
+
+def get_etf_vol_universe():
+
+    # s = "select ticker, security_sub_type," \
+    #     "avg(volume * last_price) as px_volume " \
+    #     "from equity_prices_view where date >= '{0}'".format(from_date.date())
+    # s += " group by ticker, security_sub_type "
+    # d = db.read_sql(s)
+    #
+    # d = d[d['px_volume'] > volume_threshold]
+    # d = d[d['security_sub_type'] == 'ETP']
+    #
+    # # Need a data quality "liquidity" test
+    # tickers = [str(t) for t in d['ticker'].values.tolist()]
+
+    universe =  ['ACWI',
+                 'AGG',
+                 'BND',
+                 'DIA',
+                 'EEM',
+                 'EFA',
+                 'EMB',
+                 'EWJ',
+                 'EWW',
+                 'EWY',
+                 'EWZ',
+                 'EZU',
+                 'FXI',
+                 'GDX',
+                 'GLD',
+                 'HEDJ',
+                 'HYG',
+                 'IBB',
+                 'IEF',
+                 'IVV',
+                 'IWF',
+                 'IWM',
+                 'IYR',
+                 'JNK',
+                 'JNUG',
+                 'KBE',
+                 'KRE',
+                 'LQD',
+                 'OIH',
+                 'QQQ',
+                 'RSX',
+                 'SLV',
+                 'SMH',
+                 'SPY',
+                 'SQQQ',
+                 'TIP',
+                 'TLT',
+                 'TQQQ',
+                 'TZA',
+                 'USO',
+                 'VGK',
+                 'VWO',
+                 'XLB',
+                 'XLE',
+                 'XLF',
+                 'XLI',
+                 'XLK',
+                 'XLP',
+                 'XLU',
+                 'XLV',
+                 'XLY',
+                 'XOP',
+                 'XRT']
+    return universe
 
 
 def get_etf_universe():
@@ -62,7 +136,7 @@ def get_futures_contracts_by_series(futures_series=None,
 
     s = "select * from futures_contracts where series_id in " \
         " (select id from futures_series where series in {0}".format(
-            dbutils.format_as_tuple_for_query(futures_series)) + ")"
+            dbutils.format_for_query(futures_series)) + ")"
     s += " and maturity_date >= '" + start_date.__str__() + "'"
     if end_date is not None:
         s += " and maturity_date <= '" + end_date.__str__() + "'"
@@ -104,6 +178,8 @@ def get_futures_generic_contract_map(futures_series=None,
         prev_maturity_date = futures_contracts.iloc[i - 1]['maturity_date']
         ind = futures_prices.index[(dates >= prev_maturity_date)
                                    & (dates < maturity_date)]
+        if len(ind) == 0:
+            continue
         k = 0
         for col in futures_contract_map.columns:
             if i + k < len(futures_contracts):
@@ -148,7 +224,7 @@ def get_generic_index_prices(tickers=None,
                              start_date=market_data_date,
                              end_date=None):
     s = "select * from generic_index_prices_view " \
-        " where ticker in {0}".format(dbutils.format_as_tuple_for_query(tickers))
+        " where ticker in {0}".format(dbutils.format_for_query(tickers))
     prices = _get_time_series_data(s=s,
                                    start_date=start_date,
                                    end_date=end_date,
@@ -160,8 +236,19 @@ def get_equity_implied_volatility(tickers=None,
                                   fields=None,
                                   start_date=market_data_date,
                                   end_date=None):
-    s = "select * from staging_orats" \
-        " where ticker in {0}".format(dbutils.format_as_tuple_for_query(tickers))
+    fs = "*"
+    if fields is not None:
+        fs = ""
+        if 'ticker' not in fields:
+            fs += 'ticker, '
+        if 'date' not in fields:
+            fs += 'date, '
+        for field in fields:
+            fs += field + ','
+        fs = fs[0:len(fs)-1]
+
+    s = "select " + fs + " from staging_orats" \
+        " where ticker in {0}".format(dbutils.format_for_query(tickers))
     prices = _get_time_series_data(s=s,
                                    start_date=start_date,
                                    end_date=end_date,
@@ -175,7 +262,7 @@ def get_equity_prices(tickers=None,
                       end_date=None):
 
     s = "select ticker, date, " + price_field + " from equity_prices_view" \
-        " where ticker in {0}".format(dbutils.format_as_tuple_for_query(tickers))
+        " where ticker in {0}".format(dbutils.format_for_query(tickers))
     prices = _get_time_series_data(s=s,
                                    start_date=start_date,
                                    end_date=end_date,
@@ -189,7 +276,7 @@ def get_futures_prices_by_tickers(tickers=None,
                                   end_date=market_data_date):
 
     s = "select * from futures_prices_view" \
-        " where ticker in {0}".format(dbutils.format_as_tuple_for_query(tickers))
+        " where ticker in {0}".format(dbutils.format_for_query(tickers))
     prices = _get_time_series_data(s=s,
                                    start_date=start_date,
                                    end_date=end_date,
@@ -221,9 +308,12 @@ def get_rolling_futures_returns_by_series(futures_series=None,
 def get_constant_maturity_futures_prices_by_series(futures_series=None,
                                                    start_date=market_data_date,
                                                    end_date=None):
-    s = "select * from constant_maturity_futures_prices_view " \
-        " where series in {0}".format(
-            dbutils.format_as_tuple_for_query(futures_series))
+
+    table_name = 'constant_maturity_futures_prices_view'
+
+    s = "select * from " + table_name
+    s += " where series in {0}".format(
+            dbutils.format_for_query(futures_series))
     prices = _get_time_series_data(s=s,
                                    start_date=start_date,
                                    end_date=end_date,
@@ -236,8 +326,11 @@ def get_constant_maturity_futures_prices_by_series(futures_series=None,
 def get_futures_prices_by_series(futures_series=None,
                                  start_date=market_data_date,
                                  end_date=None):
-    s = "select * from futures_prices_view where series in {0}".format(
-        dbutils.format_as_tuple_for_query(futures_series))
+
+    table_name = 'futures_prices_view'
+
+    s = "select * from " + table_name + " where series in {0}".format(
+        dbutils.format_for_query(futures_series))
     prices = _get_time_series_data(s=s,
                                    start_date=start_date,
                                    end_date=end_date,
@@ -248,40 +341,20 @@ def get_futures_prices_by_series(futures_series=None,
 def get_generic_futures_prices_by_series(futures_series=None,
                                          start_date=market_data_date,
                                          end_date=None,
-                                         include_contract_map=False):
+                                         mapped_view=True):
 
-    s = "select * from generic_futures_prices_view where series in {0}".format(
-        dbutils.format_as_tuple_for_query(futures_series))
+    if mapped_view:
+        table_name = 'generic_futures_prices_mapped_view'
+    else:
+        table_name = 'generic_futures_prices_view'
+
+    s = "select * from " + table_name + " where series in {0}".format(
+        dbutils.format_for_query(futures_series))
 
     prices = _get_time_series_data(s=s,
                                    start_date=start_date,
                                    end_date=end_date,
                                    index_fields=['date', 'ticker'])
-
-    if include_contract_map:
-
-        # Map to actual contract months
-        contract_map, futures_contracts = get_futures_generic_contract_map(
-            futures_series=futures_series,
-            price_field='settle_price',
-            start_date=start_date)
-
-        contract_map = contract_map.stack('ticker')
-
-        contract_map.name = 'contract_ticker'
-
-        prices = prices.join(contract_map)
-
-        futures_contracts = futures_contracts.rename(
-            columns={'ticker': 'contract_ticker'})
-
-        # Map to expiration dates so we can calculate time to roll
-        prices = pd.merge(left=futures_contracts,
-                          right=prices.reset_index(),
-                          on='contract_ticker')
-        prices.index = [prices['date'], prices['ticker']]
-        del prices['ticker']
-        del prices['date']
 
     return prices
 
@@ -303,8 +376,8 @@ def get_cftc_positioning_by_series(futures_series=None,
                    'dealer_positions_short_all',
                    'asset_mgr_positions_long_all',
                    'asset_mgr_positions_short_all',
-                   'lev_Money_positions_long_all',
-                   'lev_Money_positions_short_all']
+                   'lev_money_positions_long_all',
+                   'lev_money_positions_short_all']
 
     # Ensure that we get the most recent data
     one_week_prior = start_date - BDay(5)
@@ -318,8 +391,8 @@ def get_cftc_positioning_by_series(futures_series=None,
     s = "select {0}".format(columns)\
             .replace('[', '').replace(']', '').replace("'", '') + \
         " from " + table_name + \
-        ' where "CFTC_Contract_Market_Code" in {0}'.format(
-        dbutils.format_as_tuple_for_query([cftc_code]))
+        ' where cftc_contract_market_code in {0}'.format(
+        dbutils.format_for_query([cftc_code]))
 
     s += " and report_date_as_mm_dd_yyyy >= '{0}'".format(one_week_prior)
     if end_date is not None:
@@ -332,12 +405,63 @@ def get_cftc_positioning_by_series(futures_series=None,
     return data
 
 
+def get_futures_ivol_by_series(futures_series=None,
+                               maturity_type=None,
+                               start_date=history_default_start_date,
+                               end_date=market_data_date,
+                               option_type="call",
+                               option_deltas=None):
+
+    # Get series id
+    series_id = db.get_futures_series(futures_series)['id'].values.tolist()
+
+    # Handle maturity type choice
+    if maturity_type == 'constant_maturity':
+        table_name = "futures_ivol_constant_maturity_by_delta"
+    elif maturity_type == 'futures_contract':
+        table_name = "futures_ivol_fixed_maturity_by_delta"
+    else:
+        raise ValueError("maturity_type must be constant_maturity"
+                         " or futures_contract")
+
+    # TODO: move this to someplace central
+    if option_type.lower() == "c":
+        option_type = "call"
+    if option_type.lower() == "p":
+        option_type = "put"
+    if not option_type.lower() in ["put", "call"]:
+        raise ValueError("option_type must be put or call")
+
+    where_str = " option_type = '{0}'".format(option_type)
+    where_str += " and date >= '{0}'".format(start_date)
+    where_str += " and date <= '{0}'".format(end_date)
+    where_str += " and series_id in {0}".format(
+        dbutils.format_for_query(series_id))
+
+    # Case: specific delta requested
+    if option_deltas is not None and option_type is not None:
+        delta_str = list()
+        for delta in option_deltas:
+            if delta in option_delta_grid:
+                if delta < 10:
+                    delta_str.append('ivol_0' + str(delta) + 'd')
+                else:
+                    delta_str.append('ivol_' + str(delta) + 'd')
+        s = " select series_id, date, days_to_maturity, {0}".format(delta_str)
+        s += " from " + table_name
+    else:
+        s = " select * from " + table_name
+    s += " where " + where_str + " order by date asc, days_to_maturity asc"
+    data = db.read_sql(s)
+    return data
+
+
 def get_optionworks_staging_ivm(codes=None,
                                 start_date=history_default_start_date,
                                 end_date=dt.datetime.today()):
 
     s = "select * from staging_optionworks_ivm where code in {0}".format(
-        dbutils.format_as_tuple_for_query(codes))
+        dbutils.format_for_query(codes))
 
     data = _get_time_series_data(s=s,
                                  start_date=start_date,
@@ -351,10 +475,139 @@ def get_optionworks_staging_ivs(codes=None,
                                 end_date=dt.datetime.today()):
 
     s = "select * from staging_optionworks_ivs where code in {0}".format(
-        dbutils.format_as_tuple_for_query(codes))
+        dbutils.format_for_query(codes))
 
     data = _get_time_series_data(s=s,
                                  start_date=start_date,
                                  end_date=end_date,
                                  index_fields=['date', 'code'])
     return data
+
+
+"""
+-------------------------------------------------------------------------------
+VOLATILITY SURFACE MANAGER
+-------------------------------------------------------------------------------
+"""
+
+
+class VolatilitySurfaceManager(object):
+
+    data=None
+
+    ivol_fields = [
+        'ticker', 'date',
+        'iv_1m', 'iv_2m', 'iv_3m',
+        'iv_1mc', 'iv_2mc', 'iv_3mc', 'iv_4mc',
+        'days_to_maturity_1mc', 'days_to_maturity_2mc',
+        'days_to_maturity_3mc', 'days_to_maturity_4mc',
+        'skew', 'curvature', 'skew_inf', 'curvature_inf'
+    ]
+
+    def __init__(self):
+
+        # Initialize data struture
+        tickers = ['SPY']
+        start_date = utils.workday(num_days=-2)
+        self.data = get_equity_implied_volatility(tickers=tickers,
+                                                  fields=self.ivol_fields,
+                                                  start_date=start_date)
+
+    def load_data(self,
+                  tickers=None,
+                  start_date=history_default_start_date,
+                  end_date=dt.datetime.today()):
+
+        data_1 = get_equity_implied_volatility(tickers=tickers,
+                                               fields=self.ivol_fields,
+                                               start_date=start_date,
+                                               end_date=end_date)
+
+        self.data = self.data.append(data_1).drop_duplicates()
+
+    def get_data(self,
+                 tickers=None,
+                 fields=None,
+                 start_date=None,
+                 end_date=dt.None.today()):
+
+        data = self.data[
+            self.data.index.get_level_values('ticker').isin(tickers)]
+
+        if start_date is not None:
+            data = data[data.index.get_level_values('date') >= start_date]
+
+        if end_date is not None:
+            data = data[data.index.get_level_values('date') <= end_date]
+
+        if fields is not None:
+            data = data[fields]
+
+        return data
+
+    def get_surface_point(self,
+                          tickers=None,
+                          call_delta=0.50,
+                          tenor_in_days=21,
+                          start_date=history_default_start_date,
+                          end_date=dt.datetime.today()):
+
+        """
+        This interpolates a single point on the constant-maturity volatility
+        surface in delta terms.
+        :param tickers:
+        :param call_delta:
+        :param tenor_in_days:
+        :param start_date:
+        :param end_date:
+        :return:
+        """
+
+        # current data source limitation
+        tenor_in_days = max(21, min(63, tenor_in_days))
+        tenors_in_days = [21, 42, 63]
+
+        # checking data format
+        if call_delta > 1.0:
+            call_delta /= 100.0
+
+        data = self.get_data(tickers=tickers,
+                             start_date=start_date,
+                             end_date=end_date)
+
+        # We store data in this format:
+        # IV = ATMIV * (1 + slope/1000 +
+        #      (curve/1000 * (delta*100 - 50)/2) * delta*100-50))
+
+        # We store the 1-month (21-day) skew/crv the 'inf' skew/crv
+        # skew = w * 1m_skew + (1-w) * inf_skew
+        # w = sqrt(21)/sqrt(252)
+        w = (constants.trading_days_per_month / float(tenor_in_days)) ** 0.5
+        if w > 1.0:
+            w = 1.0
+
+        skew = w * data['skew'] + (1-w) * data['skew_inf']
+        curve = w * data['curvature'] + (1-w) * data['curvature_inf']
+
+        tmp_int = interp1d(tenors_in_days,
+                           data[['iv_1m', 'iv_2m', 'iv_3m']] ** 2.0)
+
+        # This is the ATM
+        atm_iv = tmp_int(tenor_in_days) ** 0.5
+
+        # Now we adjust for the delta
+        if call_delta == 0.5:
+            iv = atm_iv
+        else:
+            iv = atm_iv * (1 + (call_delta * 100.0 - 50.0) *
+                (skew / 1000.0 + (curve / 1000.0 *
+                (call_delta * 100 - 50.0) / 2.0)))
+
+        return iv
+
+
+
+
+
+
+

@@ -193,13 +193,17 @@ class DateUtils(object):
         if date is None:
             date = dt.datetime.today()
 
-        return date + num_days * my_bday
+        return date + (num_days * my_bday)
 
     @classmethod
     def networkdays(cls,
                     start_date=None,
                     end_date=None,
                     calendar_name=default_calendar):
+
+        if is_iterable(start_date):
+            if len(start_date) == 0:
+                raise ValueError("start date cannot be zero-length!")
 
         if isinstance(start_date, pd.Series):
             start_date = start_date.values
@@ -235,6 +239,29 @@ class DateUtils(object):
             return df['net_workdays'].values[0].tolist()
         else:
             return df['net_workdays'].values.tolist()
+
+
+def get_days_from_maturity(start_date=None,
+                           maturity_date=None,
+                           date=None,
+                           calendar_name='UnitedStates'):
+
+        days_to_maturity = networkdays(start_date=start_date,
+                                       end_date=maturity_date,
+                                       calendar_name=calendar_name)
+        days_elapsed = networkdays(start_date=start_date,
+                                   end_date=date,
+                                   calendar_name=calendar_name)
+        total_days = days_to_maturity + days_elapsed
+
+        # Handle forward start
+        if is_iterable(days_elapsed):
+            days_elapsed[days_elapsed < 0] = 0
+        else:
+            if days_elapsed < 0:
+                days_elapsed = 0
+
+        return days_to_maturity, days_elapsed
 
 
 def networkdays(start_date=None,

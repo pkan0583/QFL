@@ -25,7 +25,7 @@ date = "{{ ds }}"
 
 dag = DAG('cftc_weekly',
           start_date=datetime(2016, 8, 26),
-          schedule_interval="0 13 * * FRI",
+          schedule_interval="0 20 * * FRI",
           default_args=default_args)
 
 t1 = PythonOperator(task_id='weekly_cftc_commodities_ingest',

@@ -5,10 +5,12 @@ from pandas.tseries.offsets import BDay
 import quandl as ql
 import numpy as np
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSON, JSONB
 from sqlalchemy.sql.expression import bindparam
 import requests
 import logging
 import simplejson as json
+
 
 import qfl.core.constants as constants
 import qfl.utilities.basic_utilities as utils
@@ -23,7 +25,7 @@ DATABASE UTILITIES
 class DatabaseUtilities(object):
 
     @staticmethod
-    def format_as_tuple_for_query(item):
+    def format_for_query(item):
 
         output = None
         if isinstance(item, str):
@@ -32,6 +34,8 @@ class DatabaseUtilities(object):
         if len(item) == 1:
             if isinstance(item[0], str):
                 output = "('" + item[0] + "')"
+            elif isinstance(item[0], int):
+                output = '(' + str(item[0]) + ')'
             else:
                 output = '(' + item[0] + ')'
         else:
@@ -469,6 +473,7 @@ class DatabaseInterface(object):
             sa.Column('high_price', sa.Float, primary_key=False),
             sa.Column('low_price', sa.Float, primary_key=False),
             sa.Column('seasonality_adj_price', sa.Float, primary_key=False),
+            sa.Column('price_change', sa.Float),
             sa.Column('open_interest', sa.Integer, primary_key=False),
             sa.Column('volume', sa.Integer, primary_key=False),
             sa.Column('days_to_maturity', sa.Integer, primary_key=False),
@@ -556,6 +561,41 @@ class DatabaseInterface(object):
             sa.Column('tick_rv_252d', sa.Float)
         )
         cls.tables['staging_orats'] = orats_staging_table
+
+        # CLEAN EQUITY IMPLIED VOLATILITY
+        equity_implied_volatility_table = sa.Table(
+            'equity_implied_volatility', cls.metadata,
+            sa.Column('ticker', sa.String(32), primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('underlying_price', sa.Float),
+            sa.Column('iv_1m', sa.Float),
+            sa.Column('iv_2m', sa.Float),
+            sa.Column('iv_3m', sa.Float),
+            sa.Column('iv_1mc', sa.Float),
+            sa.Column('days_to_maturity_1mc', sa.Float),
+            sa.Column('iv_2mc', sa.Float),
+            sa.Column('days_to_maturity_2mc', sa.Float),
+            sa.Column('iv_3mc', sa.Float),
+            sa.Column('days_to_maturity_3mc', sa.Float),
+            sa.Column('iv_4mc', sa.Float),
+            sa.Column('days_to_maturity_4mc', sa.Float),
+            sa.Column('skew', sa.Float),
+            sa.Column('curvature', sa.Float),
+            sa.Column('skew_inf', sa.Float),
+            sa.Column('curvature_inf', sa.Float),
+            sa.Column('rv_10d', sa.Float),
+            sa.Column('rv_20d', sa.Float),
+            sa.Column('rv_60d', sa.Float),
+            sa.Column('rv_120d', sa.Float),
+            sa.Column('rv_252d', sa.Float),
+            sa.Column('tick_rv_10d', sa.Float),
+            sa.Column('tick_rv_20d', sa.Float),
+            sa.Column('tick_rv_60d', sa.Float),
+            sa.Column('tick_rv_120d', sa.Float),
+            sa.Column('tick_rv_252d', sa.Float)
+        )
+        cls.tables['equity_implied_volatility'] \
+            = equity_implied_volatility_table
 
         # STAGING TABLES FOR OPTIONWORKS
         optionworks_ivm_staging_table = sa.Table(
@@ -789,6 +829,17 @@ class DatabaseInterface(object):
         )
         cls.tables['yfinance_metadata'] = yfinance_metadata_table
 
+        # MODEL OUTPUTS
+        model_outputs_table = sa.Table(
+            'model_outputs', cls.metadata,
+            sa.Column('model', sa.String(64), primary_key=True),
+            sa.Column('output_id', sa.String(64), primary_key=True),
+            sa.Column('model_config', JSONB, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('value', sa.Float)
+        )
+        cls.tables['model_outputs'] = model_outputs_table
+
     @classmethod
     def create_tables(cls):
         cls.metadata.create_all(cls.engine)
@@ -826,7 +877,7 @@ class DatabaseInterface(object):
                         df=None,
                         table=None,
                         use_column_as_key=None,
-                        extra_careful=True,
+                        extra_careful=False,
                         time_series=False):
 
         """
@@ -973,7 +1024,7 @@ class DatabaseInterface(object):
 
         if tickers is not None:
             tickers = [str(ticker) for ticker in tickers]
-            t = DatabaseUtilities.format_as_tuple_for_query(tickers)
+            t = DatabaseUtilities.format_for_query(tickers)
             s += " and ticker in {0}".format(t)
 
         data = cls.read_sql(s)
@@ -1060,10 +1111,10 @@ class DatabaseInterface(object):
     def get_futures_series(cls, futures_series=None, exchange_code=None):
 
         where_str = " series in {0}".format(
-            DatabaseUtilities.format_as_tuple_for_query(futures_series))
+            DatabaseUtilities.format_for_query(futures_series))
         if exchange_code is not None:
             where_str += " and exchange in {0}".format(
-                DatabaseUtilities.format_as_tuple_for_query(exchange_code))
+                DatabaseUtilities.format_for_query(exchange_code))
         futures_series_data = cls.get_data(table_name='futures_series',
                                            where_str=where_str)
         return futures_series_data

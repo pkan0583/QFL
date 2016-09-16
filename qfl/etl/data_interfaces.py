@@ -16,6 +16,7 @@ import logging
 
 import urllib2
 import simplejson as json
+import xmltodict
 
 import qfl.core.constants as constants
 
@@ -651,24 +652,41 @@ class QuandlApi(ExternalDataApi):
                                    'generic_dataset',
                                    'contracts_series',
                                    'generic_series',
-                                   'start_date'])
+                                   'start_date',
+                                   'num_generic_contracts'])
 
         sd = dt.datetime(1990, 1, 1)
 
-        df.loc[0] = ['SP', 'CME', 'CHRIS', 'SP', 'CME_SP', sd]
-        df.loc[1] = ['ES', 'CME', 'CHRIS', 'ES', 'CME_ES', sd]
-        df.loc[2] = ['CL', 'CME', 'CHRIS', 'CL', 'CME_CL', sd]
-        df.loc[3] = ['BB', 'CME', 'CHRIS', 'BB', 'CME_BB', sd]
-        df.loc[4] = ['GC', 'CME', 'CHRIS', 'GC', 'CME_GC', sd]
-        df.loc[5] = ['SI', 'CME', 'CHRIS', 'SI', 'CME_SI', sd]
-        df.loc[6] = ['NG', 'CME', 'CHRIS', 'NG', 'CME_NG', sd]
-        df.loc[7] = ['ED', 'CME', 'CHRIS', 'ED', 'CME_ED', sd]
-        df.loc[8] = ['EC', 'CME', 'CHRIS', 'EC', 'CME_EC', sd]
-        df.loc[9] = ['JY', 'CME', 'CHRIS', 'JY', 'CME_JY', sd]
-        df.loc[10] = ['VX', 'CBOE', 'CHRIS', 'VX', 'CBOE_VX', sd]
-        df.loc[11] = ['FVS', 'EUREX', 'CHRIS', 'FVS', 'EUREX_FVS', sd]
+        df.loc[0] = ['SP', 'CME', 'CHRIS', 'SP', 'CME_SP', sd, 3]
+        df.loc[1] = ['ES', 'CME', 'CHRIS', 'ES', 'CME_ES', sd, 3]
+        df.loc[2] = ['CL', 'CME', 'CHRIS', 'CL', 'CME_CL', sd, 12]
+        df.loc[3] = ['B',  'ICE', 'CHRIS', 'B',  'ICE_B',  sd, 12]
+        df.loc[4] = ['BB', 'CME', 'CHRIS', 'BB', 'CME_BB', sd, 12]
+        df.loc[5] = ['GC', 'CME', 'CHRIS', 'GC', 'CME_GC', sd, 3]
+        df.loc[6] = ['SI', 'CME', 'CHRIS', 'SI', 'CME_SI', sd, 3]
+        df.loc[7] = ['NG', 'CME', 'CHRIS', 'NG', 'CME_NG', sd, 12]
+        df.loc[8] = ['ED', 'CME', 'CHRIS', 'ED', 'CME_ED', sd, 3]
+        df.loc[9] = ['EC', 'CME', 'CHRIS', 'EC', 'CME_EC', sd, 3]
+        df.loc[10] = ['JY', 'CME', 'CHRIS', 'JY', 'CME_JY', sd, 3]
+        df.loc[11] = ['VX', 'CBOE', 'CHRIS', 'VX', 'CBOE_VX', sd, 8]
+        df.loc[12] = ['FVS', 'EUREX', 'CHRIS', 'FVS', 'EUREX_FVS', sd, 6]
 
         return df
+
+    @staticmethod
+    def get_currency_prices(tickers=None, start_date=None, end_date=None):
+
+        # Tickers assumed to be in ABCXYZ format
+        if not utils.is_iterable(tickers):
+            tickers = [tickers]
+        quandl_tickers = ['CURRFX/' + ticker for ticker in tickers]
+        data = QuandlApi.get_data(quandl_tickers, start_date, end_date)
+        data = data.reset_index()
+        data['ticker'] = data['ticker'].str.replace('CURRFX/', '')
+        data = data.rename(columns={'High (est)': 'high_price',
+                                     'Low (est)': 'low_price',
+                                     'Rate': 'last_price'})
+        return data
 
     @staticmethod
     def get_orats_data_from_api(tickers=None, start_date=None, end_date=None):
@@ -952,7 +970,10 @@ class QuandlApi(ExternalDataApi):
         # Column names are an amalgam of ticker and field
         data = raw_data.stack()
         col_names = data.index.get_level_values(1).tolist()
-        long_tickers, fields = zip(*[s.split(' - ') for s in col_names])
+        try:
+            long_tickers, fields = zip(*[s.split(' - ') for s in col_names])
+        except:
+            x=1
 
         data.index.names = ['date', 'ticker']
         data = data.reset_index()
@@ -973,6 +994,7 @@ class QuandlApi(ExternalDataApi):
                        'Low': 'low_price',
                        'Open': 'open_price',
                        'Settle': 'settle_price',
+                       'Change': 'price_change',
                        'Prev. Day Open Interest': 'open_interest',
                        'Total Volume': 'volume'}
         df = df.rename(columns=rename_cols)
@@ -983,7 +1005,8 @@ class QuandlApi(ExternalDataApi):
                                                    futures_series=None,
                                                    source_series=None,
                                                    contract_range=None,
-                                                   start_date=None):
+                                                   start_date=None,
+                                                   end_date=dt.datetime.today()):
 
         # Obnoxious, need to manage this stuff somewhere
         date_field = 'Date'
@@ -991,89 +1014,51 @@ class QuandlApi(ExternalDataApi):
             or source_series[0:min(len(source_series), 4)] == "CBOE":
                 date_field = 'Trade Date'
 
+        if start_date is None:
+            start_date = dt.datetime(1990, 1, 1)
+
         generic_ticker_range = contract_range
-        generic_tickers_short = [futures_series + str(i)
-                                 for i in generic_ticker_range]
         generic_tickers = [dataset + '/' + source_series + str(i)
                            for i in generic_ticker_range]
-        futures_data = pd.DataFrame()
 
-        i = 0
-        for ticker in generic_tickers:
-            try:
-                tmp = ql.get(ticker, start_date=start_date)
-                logging.info(ticker + " success...")
-            except:
-                logging.info(ticker + " failure...")
-                continue
+        futures_data = QuandlApi.get_data(tickers=generic_tickers,
+                                          start_date=start_date,
+                                          end_date=end_date)
 
-            tmp['ticker'] = generic_tickers_short[i]
+        futures_data = futures_data.reset_index()
 
-            if len(tmp) == 0:
-                continue
+        cols = ['Change', 'Close', 'High', 'Low', 'Open',
+                'Prev. Day Open Interest', 'Settle', 'Total Volume']
+        for col in cols:
+            if col in futures_data.columns:
+                futures_data[col] = pd.to_numeric(futures_data[col])
 
-            tmp = tmp[np.isfinite(tmp['Settle'])]
-            tmp = tmp.reset_index()
-            tmp.index = [tmp['ticker'], tmp[date_field]]
-            tmp['contract_number'] = contract_range[i]
+        futures_data = futures_data[np.isfinite(futures_data['Settle'])]
+        futures_data['ticker'] = futures_data['ticker']\
+            .str.replace(dataset + "/", "")\
+            .str.replace(source_series, futures_series)
+        futures_data = futures_data.rename(columns={date_field: 'date'})
+        futures_data['contract_number'] = futures_data['ticker'].str[-1]
 
-            if len(futures_data) == 0:
-                futures_data = tmp
-            else:
-                futures_data = futures_data.append(
-                    tmp)
-
-            i += 1
-
-        if len(futures_data) > 0:
-            futures_data = futures_data[
-                futures_data[date_field] >= start_date]
-            del futures_data['ticker']
-            del futures_data[date_field]
-
-        else:
-            logging.info("no data retrieved...")
+        futures_data = futures_data[futures_data['date'] >= start_date]
+        futures_data = futures_data.set_index(['ticker', 'date'], drop=True)
+        futures_data = QuandlApi.map_futures_columns(futures_data)
+        futures_data.index.names = ['ticker', 'date']
 
         return futures_data
 
     @staticmethod
-    def retrieve_historical_vix_futures_prices(
-            start_date=dt.datetime(2007, 3, 24)):
-
-        dataset = 'CBOE'
-        futures_series = 'VX'
-        futures_data = QuandlApi.retrieve_historical_futures_prices(
-            start_date=start_date,
-            dataset=dataset,
-            futures_series=futures_series
-        )
-        return futures_data
-
-    @staticmethod
-    def retrieve_historical_vstoxx_futures_prices(
-            start_date=dt.datetime(2012, 1, 1)):
-
-        dataset = 'EUREX'
-        futures_series = 'FVS'
-        futures_data = QuandlApi.retrieve_historical_futures_prices(
-            start_date=start_date,
-            dataset=dataset,
-            futures_series=futures_series
-        )
-        return futures_data
-
-    @staticmethod
-    def update_daily_futures_prices(date=None,
+    def update_daily_futures_prices(start_date=None,
                                     dataset=None,
                                     futures_series=None,
                                     contract_range=np.arange(1, 10)):
 
-        if date is None:
-            date = utils.workday(dt.datetime.today(), -1)
+        if start_date is None:
+            start_date = utils.workday(dt.datetime.today(), -1)
 
         # Figure out which months to request
-        month = date.month
-        year = date.year
+        month = start_date.month
+        year = start_date.year
         months = list()
         years = list()
         for c in contract_range:
@@ -1102,7 +1087,7 @@ class QuandlApi(ExternalDataApi):
             futures_tickers_df.loc[ticker, 'month'] = month
             futures_tickers_df.loc[ticker, 'short_ticker'] = short_ticker
 
-        start_date = date - BDay(1)
+        start_date = start_date - BDay(1)
         futures_data = QuandlApi.get_data(futures_tickers,
                                           start_date=start_date)
 
@@ -1126,6 +1111,7 @@ class QuandlApi(ExternalDataApi):
 
     @staticmethod
     def retrieve_historical_futures_prices(start_date=None,
+                                           end_date=dt.datetime.today(),
                                            dataset=None,
                                            futures_series=None,
                                            contract_months_list=None):
@@ -1143,42 +1129,35 @@ class QuandlApi(ExternalDataApi):
 
         years = np.arange(start_date.year, dt.datetime.today().year + 2)
 
-        futures_data = pd.DataFrame()
         futures_tickers = list()
         futures_tickers_df = pd.DataFrame(columns=['year', 'month'])
         for year in years:
             for month in contract_months:
 
-                short_ticker = futures_series + contract_months[
-                    month] + str(year)
                 ticker = dataset + "/" + futures_series \
                     + contract_months[month] + str(year)
                 futures_tickers.append(ticker)
                 futures_tickers_df.loc[ticker, 'year'] = year
                 futures_tickers_df.loc[ticker, 'month'] = month
 
-                logging.info(short_ticker)
+        futures_data = QuandlApi.get_data(tickers=futures_tickers,
+                                          start_date=start_date,
+                                          end_date=end_date)
+        futures_data = futures_data.reset_index()
 
-                try:
-                    tmp = ql.get(ticker)
-                except:
-                    logging.info('failed!')
-                    continue
+        cols = ['Change', 'Close', 'High', 'Low', 'Open',
+                'Prev. Day Open Interest', 'Settle', 'Total Volume']
+        for col in cols:
+            if col in futures_data.columns:
+                futures_data[col] = pd.to_numeric(futures_data[col])
 
-                tmp['ticker'] = short_ticker
-                tmp = tmp[np.isfinite(tmp['Settle'])]
-                tmp = tmp.reset_index()
-                tmp.index = [tmp['ticker'], tmp[date_field]]
+        futures_data = futures_data[np.isfinite(futures_data['Settle'])]
+        futures_data['ticker'] = futures_data['ticker']\
+            .str.replace(dataset + "/", "")
+        futures_data = futures_data.rename(columns={date_field: 'date'})
 
-                if len(futures_data) == 0:
-                    futures_data = tmp
-                else:
-                    futures_data = futures_data.append(tmp)
-        futures_data = futures_data[
-            futures_data[date_field] >= start_date]
-        del futures_data['ticker']
-        del futures_data[date_field]
-
+        futures_data = futures_data[futures_data['date'] >= start_date]
+        futures_data = futures_data.set_index(['ticker', 'date'], drop=True)
         futures_data = QuandlApi.map_futures_columns(futures_data)
         futures_data.index.names = ['ticker', 'date']
 
@@ -1417,6 +1396,183 @@ class YahooApi(ExternalDataApi):
 
 '''
 --------------------------------------------------------------------------------
+NUTMEG PORTFOLIO ADAPTER
+--------------------------------------------------------------------------------
+'''
+
+
+class NutmegAdapter(object):
+
+    _parsed_xml_data = None
+    _is_loaded = False
+
+    def __init__(self, xml_file=None):
+
+        if isinstance(xml_file, str):
+            xml_file = open(xml_file)
+
+        self._parsed_xml_data = xmltodict.parse(xml_file)
+        self._is_loaded = True
+
+    def dump_portfolio_to_json(self):
+
+        portfolio_data_json = json.dumps(self._parsed_xml_data)
+        return portfolio_data_json
+
+    def get_full_dataset(self):
+
+        portfolio_data = self._parsed_xml_data['userSummaryAdmins'] \
+                                              ['userSummaryAdmin']
+
+        return portfolio_data
+
+    def get_account_names(self):
+
+        portfolio_data = self.get_full_dataset()
+
+        # This is a list of accounts
+        accounts = portfolio_data['accounts']['account']
+
+        account_names = list()
+        for i in range(0, len(accounts)):
+            account_names.append(accounts[i]['accountType'])
+
+        return account_names
+
+    def get_account(self, account_name=None):
+
+        # Check that it's a valid account
+        account_names = self.get_account_names()
+        if account_name not in account_names:
+            raise ValueError("valid account names: {0}".format(account_names))
+
+        account_index = account_names.index(account_name)
+        portfolio_data = self.get_full_dataset()
+        account = portfolio_data['accounts']['account'][account_index]
+
+        return account
+
+    def get_fund_names(self, account_name=None):
+
+        fund_names = list()
+        account = self.get_account(account_name)
+        funds = account['funds']['fund']
+        for i in range(0, len(funds)):
+            fund_names.append(funds[i]['name'])
+        return fund_names
+
+    def get_fund(self, account_name=None, fund_name=None):
+
+        account = self.get_account(account_name)
+        fund_names = self.get_fund_names(account_name)
+
+        # Check that request is a valid fund
+        if fund_name not in fund_names:
+            raise ValueError("valid fund names: {0}".format(fund_names))
+
+        fund_index = fund_names.index(fund_name)
+        fund = account['funds']['fund'][fund_index]
+
+        return fund
+
+    def extract_fund_data(self, account_name=None, fund_name=None):
+
+        fund = self.get_fund(account_name, fund_name)
+
+        # Check that fund is active
+        if fund['operationalStatus'] != "ACTIVE":
+            raise ValueError("Fund not active!")
+
+        # Contributions
+        cash_flows_dict = fund['contributionActivity']['postingSummary']
+
+        # Mapping contributions data into tabular format
+        cash_flows = pd.DataFrame(index=range(0, len(cash_flows_dict)),
+                                  columns=cash_flows_dict[0].keys())
+        for i in range(0, len(cash_flows_dict)):
+            cash_flows.loc[i] = cash_flows_dict[i].values()
+
+        # Some formatting issues
+        cash_flows['value'] = pd.to_numeric(cash_flows['value'])
+        cash_flows['postedDate'] = pd.to_datetime(pd.to_datetime(
+            cash_flows['postedDate']).dt.date)
+        cash_flows = cash_flows.sort_values('postedDate')
+
+        # Transactions
+        transactions_dict = fund['stockSummaries']['stockSummary']
+
+        # Transaction data columns
+        columns = ['sequence',
+                   'postedDate',
+                   'transactionType',
+                   'transactionRef',
+                   'assetCode',
+                   'units',
+                   'value']
+
+        # Mapping the transaction data into tabular format
+        transactions = pd.DataFrame(columns=columns)
+        counter = 0
+        for i in range(0, len(transactions_dict)):
+            entries = transactions_dict[i]['entries']
+            for j in range(0, len(entries)):
+                if 'transactionType' in entries[j]:
+                    transactions.loc[counter] = entries[j].values()
+                    counter += 1
+
+        # Some formatting issues
+        transactions['value'] = pd.to_numeric(transactions['value'])
+        transactions['units'] = pd.to_numeric(transactions['units'])
+        transactions['postedDate'] = pd.to_datetime(pd.to_datetime(
+            transactions['postedDate']).dt.date)
+        transactions = transactions.sort_values('postedDate')
+
+        # Change sells to negative quantity
+        ind = transactions.index[
+            transactions['transactionType'] == 'SLD']
+        transactions.loc[ind, ['units', 'value']] *= -1.0
+
+        # Security code universe
+        unique_asset_codes = np.unique(transactions['assetCode'])
+
+        # Dividends
+        investments_dict = fund['investmentActivity']['postingSummary']
+        cols = investments_dict[0].keys() + ['transactionText']
+        investments = pd.DataFrame(index=range(0, len(investments_dict)),
+                                   columns=cols)
+        for i in range(0, len(investments_dict)):
+            investments.loc[i] = investments_dict[i]
+        investments['value'] = pd.to_numeric(investments['value'])
+        investments['units'] = pd.to_numeric(investments['units'])
+        investments['postedDate'] = pd.to_datetime(
+            pd.to_datetime(investments['postedDate']).dt.date)
+        investments = investments.sort_values('postedDate')
+
+        # Identify dividends and other adjustments
+        investments['transactionText'] = investments['transactionText']\
+            .fillna(value='')
+        security_income = investments[investments['transactionText']
+            .str.contains('Dividend')]
+        other_adjustments = investments[investments['transactionText']
+            .str.contains('Adjustment')]
+
+        # Standardize columns
+        col_map = {'postedDate': 'date',
+                   'units': 'quantity',
+                   'value': 'market_value',
+                   'assetCode': 'asset_id'}
+        cash_flows = cash_flows.rename(columns=col_map)
+        transactions = transactions.rename(columns=col_map)
+        security_income = security_income.rename(columns=col_map)
+        other_adjustments = other_adjustments.rename(columns=col_map)
+
+        return transactions, cash_flows, security_income, other_adjustments, \
+               unique_asset_codes
+
+
+
+'''
+--------------------------------------------------------------------------------
 DATA SCRAPER
 --------------------------------------------------------------------------------
 '''
@@ -1451,15 +1607,16 @@ class DataScraper(object):
     def retrieve_cftc_commodity_positioning_data(full_history=False,
                                                  year=2016):
 
+        category = 'commodity'
         update_filename = 'fut_disagg_xls_' + str(year) + '.zip'
         update_data = DataScraper._retrieve_cftc_positioning_data(
-            filename=update_filename)
+            filename=update_filename, category=category)
 
         if full_history:
             history_filename = 'fut_disagg_xls_hist_2006_2015.zip'
 
             history_data = DataScraper._retrieve_cftc_positioning_data(
-                filename=history_filename)
+                filename=history_filename, category=category)
 
             update_data = update_data.append(history_data)
 
@@ -1469,25 +1626,26 @@ class DataScraper(object):
     def retrieve_cftc_financial_positioning_data(full_history=False,
                                                  year=2016):
 
+        category = 'financials'
         update_filename = 'fut_fin_xls_' + str(year) + '.zip'
         update_data = DataScraper._retrieve_cftc_positioning_data(
-            filename=update_filename)
+            filename=update_filename, category=category)
 
         if full_history:
             history_filename = 'fut_fin_xls_hist_2006_2015.zip'
 
             history_data = DataScraper._retrieve_cftc_positioning_data(
-                filename=history_filename)
+                filename=history_filename, category=category)
 
             update_data = update_data.append(history_data)
 
         return update_data
 
     @staticmethod
-    def _retrieve_cftc_positioning_data(filename=None):
+    def _retrieve_cftc_positioning_data(filename=None, category=None):
 
         base_url = 'http://www.cftc.gov/files/dea/history/'
-        temp_filename = "data/temp_cftc.zip"
+        temp_filename = "data/temp_cftc_" + category + ".zip"
 
         url = base_url + filename
         urllib.urlretrieve(url, temp_filename)
@@ -1507,7 +1665,7 @@ class DataScraper(object):
         base_url = 'https://www.stoxx.com/document/Indices'
         url = base_url + '/Current/HistoricalData/h_v2tx.txt'
         data = pd.read_table(url, sep=';')
-        data['Date'] = pd.to_datetime(data['Date'])
+        data['Date'] = pd.to_datetime(data['Date'], dayfirst=True)
         data['Symbol'] = 'V2X'
         data = data.rename(columns={'Date': 'date',
                                     'Symbol': 'ticker',

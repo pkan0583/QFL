@@ -1,34 +1,24 @@
-
-import pandas as pd
 import datetime as dt
-import pandas_datareader.data as pdata
+
 import matplotlib.pyplot as plt
-import numpy as np
-import pyfolio
-import urllib
-import pymc
-import requests
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter, A4
-import statsmodels.tsa.stattools as sm
-import qfl.core.data_interfaces as data_int
-import qfl.core.database_interface as qfl_data
-from qfl.core.data_interfaces import QuandlApi, YahooApi
-from qfl.core.database_interface import DatabaseInterface as db
-from qfl.core.database_interface import DatabaseUtilities as dbutils
-import qfl.core.calcs as calcs
-import qfl.core.market_data as md
-import qfl.macro.macro_models as macro
-import qfl.etl.data_ingest as etl
-import qfl.core.calcs as lib
-import qfl.utilities.basic_utilities as utils
-import qfl.core.constants as constants
-from scipy import interpolate
 import matplotlib.ticker as mtick
+import numpy as np
+import pandas as pd
+import pandas_datareader.data as pdata
+import pyfolio
+import pymc
 from matplotlib import cm
-import logging
-from pandas.tseries.offsets import BDay
-from scipy import interpolate
+
+import qfl.core.calcs as calcs
+import qfl.core.calcs as lib
+import qfl.core.database_interface as qfl_data
+import qfl.core.market_data as md
+import qfl.core.constants as constants
+import qfl.etl.data_ingest as etl
+import qfl.etl.data_interfaces as data_int
+import qfl.macro.macro_models as macro
+import qfl.utilities.basic_utilities as utils
+import qfl.core.portfolio_utils as putils
 
 reload(calcs)
 reload(utils)
@@ -37,349 +27,397 @@ reload(data_int)
 reload(md)
 reload(etl)
 
-from qfl.core.data_interfaces import QuandlApi, YahooApi, IBApi, FigiApi, DataScraper
-from qfl.core.database_interface import DatabaseInterface as db, DatabaseUtilities as dbutils
+from qfl.etl.data_interfaces import QuandlApi, IBApi, DataScraper, NutmegAdapter, YahooApi
+from qfl.core.database_interface import DatabaseInterface as db
 from qfl.utilities.chart_utilities import format_plot
 from qfl.utilities.nlp import DocumentsAnalyzer as da
 
-from collections import defaultdict
 from gensim import corpora, models, similarities
-import odo
+
 
 db.initialize()
 
-# Mapping
-etl.process_optionworks_mappings()
+reload(md)
+from qfl.core.market_data import VolatilitySurfaceManager
+
+vsm = VolatilitySurfaceManager()
+vsm.load_data(tickers=['EWZ'])
+tmp = vsm.get_surface_point(tickers=['EWZ'], call_delta=0.75, tenor_in_days=30)
+
+# What if I need
 
 
 '''
 --------------------------------------------------------------------------------
-Nutmeg export
+Volatility relative value
 --------------------------------------------------------------------------------
 '''
 
-import xmltodict
-import simplejson as json
+# OK. Pure version: static strategy  would have PNL equal to
+# gamma PNL plus term structure rolldown, e.g. it's as-if you owned
+# an option that day
 
-xml_file = open("data/AM.xml")
-am_dict = xmltodict.parse(xml_file)
+# Key thing here is that we have a PNL stream for every underlying
+# So there's no "static strategy"
+# I think I need 'portfolio RV strategy' or something
 
-xml_file = open("data/NH.xml")
-nh_dict = xmltodict.parse(xml_file)
+import qfl.strategies.volswap_rv as volswap_rv
+reload(volswap_rv)
+from qfl.strategies.volswap_rv import VolswapRvStrategy as vrv
 
-nh_data = nh_dict['userSummaryAdmins']['userSummaryAdmin']
-nh_account_data = nh_data['accounts']['account']
-test_json = json.dumps(nh_data)
-test_json_extract = json.loads(test_json)
+vrv.initialize_data()
+vrv.process_data()
 
-# Example funds with relatively large balances (main funds)
-nh_savings_fund_general = nh_account_data[1]['funds']['fund'][6]
-nh_pension_fund_general = nh_account_data[0]['funds']['fund'][2]
+rv_iv_signals = vrv.initialize_rv_iv_signals()
+iv_signals = vrv.initialize_iv_signals()
+ts_signals = vrv.initialize_ts_signals()
 
-# Contributions
-nh_contributions = nh_savings_fund_general['contributionActivity']['postingSummary']
+rv_iv_pnl, rv_iv_pos, rv_iv_pctile \
+    = vrv.compute_signal_quantile_performance(signal_data=rv_iv_signals)
 
-# Mapping contributions data into tabular format
-nh_c_df = pd.DataFrame(index=range(0, len(nh_contributions)),
-                       columns=nh_contributions[0].keys())
-for i in range(0, len(nh_contributions)):
-    nh_c_df.loc[i] = nh_contributions[i].values()
+iv_pnl, iv_pos, iv_pctile \
+    = vrv.compute_signal_quantile_performance(signal_data=iv_signals)
 
-# Some formatting issues
-nh_c_df['value'] = pd.to_numeric(nh_c_df['value'])
-nh_c_df['postedDate'] = pd.to_datetime(pd.to_datetime(
-    nh_c_df['postedDate']).dt.date)
-nh_c_df = nh_c_df.sort_values('postedDate')
+ts_pnl, ts_pos, ts_pctile \
+    = vrv.compute_signal_quantile_performance(signal_data=ts_signals)
 
-# Transactions
-nh_transactions = nh_savings_fund_general['stockSummaries']['stockSummary']
+# signal_pnl, signal_pos, signal_pctile = vrv.compute_master_backtest()
+print('done!')
 
-# Transaction data columns
-columns = ['sequence',
-           'postedDate',
-           'transactionType',
-           'transactionRef',
-           'assetCode',
-           'units',
-           'value']
+# Save
+vrv_data = vrv.data
+vrv_settings = vrv.settings
+vrv_calc = vrv.calc
 
-# Mapping the transaction data into tabular format
-nh_t_df = pd.DataFrame(columns=columns)
-counter = 0
-for i in range(0, len(nh_transactions)):
-    posted_date = nh_transactions[i]['postedDate']
-    entries = nh_transactions[i]['entries']
-    for j in range(0, len(entries)):
-        if 'transactionType' in entries[j]:
-            nh_t_df.loc[counter] = entries[j].values()
-            counter += 1
+# Restore
+vrv.data = vrv_data
+vrv.settings = vrv_settings
+vrv.calc = vrv_calc
 
-# Some formatting issues
-nh_t_df['value'] = pd.to_numeric(nh_t_df['value'])
-nh_t_df['units'] = pd.to_numeric(nh_t_df['units'])
-nh_t_df['postedDate'] = pd.to_datetime(pd.to_datetime(
-    nh_t_df['postedDate']).dt.date)
-nh_t_df = nh_t_df.sort('postedDate')
+signal_pnl = rv_iv_pnl
+signal_positions = rv_iv_pos
+quantiles = signal_pnl.keys()
+signal_com = np.unique(signal_pnl[1.0].columns.get_level_values(None))
 
-# Security code universe
-unique_asset_codes = np.unique(nh_t_df['assetCode'])
+buy_q = 0.80
+sell_q = 0.20
+tc_vega = 0.1
 
-# I'm not exactly sure how this is different... non-stock trades? AH DIVS ETC
-nh_investments = nh_savings_fund_general['investmentActivity']['postingSummary']
-nh_i_df = pd.DataFrame(index=range(0, len(nh_investments)),
-                       columns=nh_investments[0].keys() + ['transactionText'])
-for i in range(0, len(nh_investments)):
-    nh_i_df.loc[i] = nh_investments[i]
-nh_i_df['value'] = pd.to_numeric(nh_i_df['value'])
-nh_i_df['units'] = pd.to_numeric(nh_i_df['units'])
-nh_i_df['postedDate'] = pd.to_datetime(
-    pd.to_datetime(nh_i_df['postedDate']).dt.date)
-nh_i_df = nh_i_df.sort_values('postedDate')
+# Comparing COM for a long/short pair of quantiles
+plt.figure()
+for com in signal_com:
+    l = signal_pnl[buy_q][com].sum(axis=1).cumsum()
+    s = signal_pnl[sell_q][com].sum(axis=1).cumsum()
+    tc = (signal_positions[buy_q][com].abs().sum(axis=1).cumsum()
+       + signal_positions[sell_q][com].abs().sum(axis=1).cumsum()) * tc_vega
+    plt.plot(l-s-tc)
+plt.legend(signal_com, loc=2)
 
-# Identify dividends
-nh_i_df['transactionText'] = nh_i_df['transactionText'].fillna(value='')
-nh_divs = nh_i_df[nh_i_df['transactionText'].str.contains('Dividend')]
-nh_adjs = nh_i_df[nh_i_df['transactionText'].str.contains('Adjustment')]
-
-# Export
-nh_c_df.to_excel("data/nh_contributions.xlsx")
-nh_t_df.to_excel("data/nh_transactions.xlsx")
+# Comparing quantiles for each COM
+for com in signal_com:
+    plt.figure()
+    for i in range(1, len(quantiles)):
+        plt.plot(signal_pnl[quantiles[i]][com].sum(axis=1).cumsum())
+    plt.legend(quantiles[1:], loc=2)
+    plt.title("com = " + str(com))
 
 '''
 --------------------------------------------------------------------------------
-Market prices
+VIX curve
 --------------------------------------------------------------------------------
 '''
 
-# Get data from the beginning of the account
-start_date = nh_data['fromDate']
+import qfl.strategies.strategies as strat
+import qfl.strategies.vol_fut_curve as vft
+reload(vft)
+reload(strat)
+from qfl.strategies.vol_fut_curve import VixCurveStrategy as vc
 
-# Tickers for yahoo and quandl
-tickers = [code + '.L' for code in unique_asset_codes]
-quandl_tickers = ['LSE/' + code for code in unique_asset_codes]
+# Beginning of semi-clean VIX futures data
+start_date = dt.datetime(2007, 3, 26)
+holding_period_days = 1
+signals_z_cap = 1.0
+vol_target_com = 63
+rolling_beta_com = 63
 
-# Raw quandl data
-raw_price_data_ql = QuandlApi.get_data(tickers=quandl_tickers,
-                                       start_date=start_date)
-price_data_ql = raw_price_data_ql.copy(deep=True).reset_index()
+# Prep
+vc.initialize_data(vol_futures_series='VX',
+                   short_month=1,
+                   long_month=5)
 
-# Adjust stuff that is quoted in Pence
-ql_lse = pd.read_csv('data/LSE-datasets-codes.csv', header=None)
-quoted_in_pence = ql_lse[ql_lse[1].str.contains('GBX')][0].values.tolist()
-quoted_in_usd = ql_lse[ql_lse[1].str.contains('USD')].values.tolist()
-ind = price_data_ql.index[price_data_ql['ticker'].isin(quoted_in_pence)]
-price_data_ql.loc[ind, ['Change', 'High', 'Last Close', 'Low', 'Price']] /= 100.0
+vc.compute_hedge_ratios(rolling_beta_com=rolling_beta_com)
 
-# Revert tickers
-price_data_ql['ticker'] = price_data_ql['ticker'].str\
-                              .replace('LSE/', '')\
-                              .astype(str) + '.L'
-price_data_ql = price_data_ql.set_index(['date', 'ticker'], drop=True)
-price_data_ql.index.names = ['date', 'asset_id']
-price_data_ql = price_data_ql.sort_index()
+# Main analysis
+vc_output = vc.compute_master_backtest(
+    holding_period_days=holding_period_days,
+    signals_z_cap=signals_z_cap,
+    vol_target_com=vol_target_com)
 
-# Try to get some data
-price_field_yf = 'Adj Close'
-raw_price_data_yf = pdata.get_data_yahoo(tickers, start=start_date)
-price_data_yf = raw_price_data_yf.to_frame()[price_field_yf]
-price_data_yf.index.names = ['date', 'asset_id']
+# Risk and return
+vc_output.combined_pnl.std()
+vc_output.combined_pnl['optim_weight'].rolling(21).sum().quantile(0.005)
+vc_output.combined_pnl_net.rolling(21).sum().mean()
 
-price_tickers = np.unique(price_data_yf.index.get_level_values('asset_id'))
-price_tickers = [str(ticker) for ticker in price_tickers]
+# Sensitivity analysis to weights
+num_sims = 1000
+sigma = 2.0
+sens_percentile = 0.01
+sim_perf_percentiles, sim_perf = \
+    strat.PortfolioOptimizer.compute_signal_portfolio_sensitivity(
+        strategy=vc,
+        signals_data=vc_output.signal_output.signals_data,
+        weights=vc_output.weights,
+        num_sims=num_sims,
+        sigma=sigma,
+        signals_z_cap=signals_z_cap,
+        holding_period_days=holding_period_days,
+        vol_target_com=vol_target_com
+    )
 
-# Missing
-missing_tickers = list(set(tickers) - set(price_tickers))
+# Basic plot
+plt.figure()
+plt.plot(vc_output.combined_pnl_net['optim_weight'].cumsum())
+plt.ylabel('cumulative strategy PNL, in vegas of max position size')
+# plt.legend(['smart weighting', 'all signals equal weight'], loc=2)
 
-# Price data to use
-price_data = price_data_ql
-price_field = 'Last Close'
+# Momentum plot
+plt.figure()
+mom_signals = ['mom_5', 'mom_10', 'mom_21', 'mom_63']
+plt.plot(vc_output.signal_output.signal_pnl[mom_signals].cumsum())
+colormap = plt.get_cmap('coolwarm')
+plt.gca().set_color_cycle([colormap(i)
+                           for i in np.linspace(0, 0.9, len(mom_signals))])
+plt.legend(mom_signals, loc=2)
+plt.ylabel('cumulative strategy PNL, in vegas of max position size')
 
-# Yield curve
-yc_data = DataScraper.retrieve_uk_yield_curve()
-uk_cash_rate = yc_data[1].fillna(method='ffill')
+# Convexity plot
+plt.figure()
+cv_signals = ['cv_0', 'cv_1', 'cv_5', 'cv_10']
+colormap = plt.get_cmap('spectral')
+plt.gca().set_color_cycle([colormap(i)
+                           for i in np.linspace(0, 0.9, len(cv_signals))])
+plt.plot(vc_output.signal_output.signal_pnl[cv_signals].cumsum())
+plt.legend(cv_signals, loc=2)
+plt.ylabel('cumulative strategy PNL, in vegas of max position size')
 
-'''
---------------------------------------------------------------------------------
-Personal Consultant performance analysis
---------------------------------------------------------------------------------
-'''
+# TS plot
+plt.figure()
+ts_signals = ['ts_0', 'ts_1', 'ts_5', 'ts_10']
+colormap = plt.get_cmap('gist_heat')
+plt.gca().set_color_cycle([colormap(i)
+                           for i in np.linspace(0, 0.9, len(ts_signals))])
+plt.plot(vc_output.signal_output.signal_pnl[ts_signals].cumsum())
+plt.legend(ts_signals, loc=2)
+plt.ylabel('cumulative strategy PNL, in vegas of max position size')
 
-# Next steps here are:
-# 1) "market value" --> needs to reflect market prices not transactions
-# 2) need to adjust cash to reflect transactions
-# 3) handle currencies
-# 4) handle asset id for various exchanges
-
-reload(utils)
-
-cash_flows = nh_c_df.sort_values('postedDate')
-transactions = nh_t_df.sort_values('postedDate')
-
-# Standardize columns
-col_map = {'postedDate': 'date',
-           'units': 'quantity',
-           'value': 'market_value',
-           'assetCode': 'asset_id'}
-cash_flows = cash_flows.rename(columns=col_map)
-transactions = transactions.rename(columns=col_map)
-security_income = nh_divs.rename(columns=col_map)
-other_adjustments = nh_adjs.rename(columns=col_map)
-
-# This is nutmeg: assume everything on London exchange
-transactions['asset_id'] = transactions['asset_id'].astype(str) + '.L'
-
-# Standardize date formats
-cash_flows['date'] = pd.to_datetime(cash_flows['date'].dt.date)
-transactions['date'] = pd.to_datetime(transactions['date'].dt.date)
-
-# Change sells to negative quantity
-ind = transactions.index[transactions['transactionType'] == 'SLD']
-transactions.loc[ind, ['quantity', 'market_value']] *= -1.0
-
-# Start date
-start_date = pd.to_datetime(cash_flows['date'].min())
-end_date = pd.to_datetime(cash_flows['date'].max())
-calendar_name = 'UnitedKingdom'
-
-# This is Nutmeg: assume all transactions in GBP
-base_currency = 'GBP'
-transactions['currency'] = base_currency
-cash_flows['currency'] = base_currency
-base_asset = 'cash_' + base_currency
-
-# Columns
-cols = ['date', 'quantity', 'market_value']
-
-# Dates
-dates = utils.DateUtils.get_business_date_range(start_date,
-                                                end_date,
-                                                calendar_name)
-start_date = dates[0]
-
-# Initial positions
-initial_positions = pd.DataFrame(index=[pd.Series(base_asset)],
-                                 columns=cols)
-initial_positions.index.names = ['asset_id']
-initial_positions.loc[base_asset, ['quantity', 'market_value']] \
-    = cash_flows[cash_flows['date'] == start_date]['market_value'].values[0]
-initial_positions.loc[base_asset, 'date'] = start_date
-
-# Iterate over dates
-positions_dict = dict()
-positions_dict[0] = initial_positions
-for t in range(1, len(dates)):
-
-    # Starting point: carry over positions
-    positions_dict[t] = positions_dict[t-1].copy(deep=True)
-    positions_dict[t]['date'] = dates[t]
-
-    # Cash balances accrue interest
-    elapsed_days = (dates[t] - dates[t-1]).days
-    daily_rate = uk_cash_rate[(uk_cash_rate.index >= dates[t - 1])
-                            & (uk_cash_rate.index < dates[t])].mean()
-
-    # Carry over prior value
-    if np.isnan(daily_rate):
-        daily_rate = prev_daily_rate
-    prev_daily_rate = daily_rate
-
-    positions_dict[t].loc[base_asset, ['quantity', 'market_value']] \
-        *= (1 + daily_rate) * elapsed_days / 365.0
-
-    # New cash flows
-    # TODO: what if the cash flow is in a different currency
-    cf = cash_flows[(cash_flows['date'] <= dates[t])
-                  & (cash_flows['date'] > dates[t - 1])]
-    positions_dict[t].loc[base_asset, ['quantity', 'market_value']]\
-        += cf['market_value'].sum()
-
-    # Security income
-    # TODO: what if the cash flow is in a different currency
-    si = security_income[(security_income['date'] <= dates[t])
-                       & (security_income['date'] > dates[t - 1])]
-    positions_dict[t].loc[base_asset, ['quantity', 'market_value']]\
-        += si['market_value'].sum()
-
-    # Adjustments
-    # TODO: what if the cash flow is in a different currency
-    oa = other_adjustments[(other_adjustments['date'] <= dates[t])
-                         & (other_adjustments['date'] > dates[t - 1])]
-    positions_dict[t].loc[base_asset, ['quantity', 'market_value']]\
-        += oa['market_value'].sum()
-
-    # New transactions
-    tt = transactions[(transactions['date'] <= dates[t])
-                    & (transactions['date'] > dates[t - 1])]
-    if len(tt) > 0:
-
-        # Debit cash account for transactions
-        positions_dict[t].loc[base_asset, ['quantity', 'market_value']]\
-            -= tt['market_value'].sum()
-
-        # Changes in existing positions
-        ind = tt.index[tt['asset_id'].isin(positions_dict[t].index)]
-        if len(ind) > 0:
-            asset_codes = tt.loc[ind, 'asset_id']
-            positions_dict[t].loc[asset_codes, ['quantity', 'market_value']] \
-                += tt.loc[ind, ['quantity', 'market_value']].values
-        # New positions
-        new_ind = tt.index[~tt['asset_id'].isin(positions_dict[t].index)]
-        if len(new_ind) > 0:
-            asset_codes = tt.loc[new_ind, 'asset_id']
-            new_df = pd.DataFrame(index=asset_codes,
-                                  columns=cols,
-                                  data=tt.loc[new_ind, cols]
-                                  .values)
-            positions_dict[t] = positions_dict[t].append(new_df)
-
-    # Mark the book
-    price_data_date = price_data[
-        price_data.index.get_level_values('date') == dates[t]].reset_index()
-    price_data_date.index = price_data_date['asset_id']
-    ind = positions_dict[t].index[
-        positions_dict[t].index.isin(price_data_date.index)]
-    positions_dict[t].loc[ind, 'market_value'] = \
-        positions_dict[t].loc[ind, 'quantity'] \
-        * price_data_date.loc[ind, price_field]
-
-positions = pd.concat(positions_dict).reset_index()
-positions.index = [positions['date'], positions['asset_id']]
-positions = positions.rename(columns={'level_0': 'date_index'})
-
-# Join positions data to price for visual inspection
-positions = positions.join(price_data['Price'])
-positions[positions.index.get_level_values('asset_id') == base_asset] = 1.0
-del positions['asset_id']
-del positions['date']
-
-account_performance = pd.DataFrame(positions['market_value'].groupby(level='date').sum())
-account_performance['daily_flows'] = cash_flows.groupby('date')['market_value'].sum()
-account_performance['daily_flows'] = account_performance['daily_flows'] .fillna(value=0)
-account_performance['pnl'] = account_performance['market_value'].diff(1)\
-                             - account_performance['daily_flows']
-account_performance['pnl_pct'] = account_performance['pnl'] \
-                                 / account_performance['market_value'].shift(1)
-
-# plt.plot((1 + account_performance['pnl_pct']).cumprod()-1)
-plt.plot(account_performance['market_value'])
-plt.ylabel('account value, GBP')
-plt.title('Reconstructed Savings Fund Value (actual end = 155,477)')
+# Signal robustness plot
+plt.figure()
+plt.plot(vc_output.combined_pnl_net.cumsum())
+plt.plot(sim_perf_percentiles.cumsum())
+cols = ['optim_weight', 'equal_weight'] + [str(c) for c in sim_perf_percentiles.columns]
+plt.legend(cols, loc=2)
 
 '''
 --------------------------------------------------------------------------------
-OptionWorks data
+Vega vs delta
 --------------------------------------------------------------------------------
 '''
 
-# data = md.get_optionworks_staging_ivm(codes=['CME_ES_EW4_'])
+import qfl.strategies.strategies as strat
+import qfl.strategies.vega_vs_delta as vdm
+reload(vdm)
+from qfl.strategies.vega_vs_delta import VegaVsDeltaStrategy as vd
+from qfl.core.database_interface import DatabaseUtilities as dbutils
+from pandas.tseries.offsets import BDay
 
-futures_series = 'C'
-maturity_type = 'futures_contract'
-start_date = dt.datetime(2009, 1, 1)
+# Beginning of semi-clean VIX futures data
+start_date = dt.datetime(2007, 3, 26)
+change_window_days_short = 5
+change_window_days_long = 252
+holding_period_days = 1
+signals_z_cap = 1.0
+vol_target_com = 63
+rolling_beta_com = 63
+tc = 0.05
 
-etl.process_optionworks_data_ivs(series_id=futures_series,
-                                 start_date=start_date,
-                                 maturity_type='constant_maturity')
+corr_r_shrinkage = 0.90
+corr_er_shrinkage = 0.70
+er_se_beta_to_er = 0.25
+er_se_beta_to_vol = 0.75
+
+vd.initialize_data()
+
+vd_output = vd.compute_master_backtest(
+    holding_period_days=holding_period_days,
+    vol_target_com=vol_target_com,
+    rolling_beta_com=rolling_beta_com,
+    signals_z_cap=signals_z_cap,
+    transaction_cost_per_unit=tc,
+    corr_r_shrinkage=corr_r_shrinkage,
+    corr_er_shrinkage=corr_er_shrinkage,
+    signal_se_beta_to_er=er_se_beta_to_er,
+    signal_se_beta_to_vol=er_se_beta_to_vol)
+
+# Sensitivity analysis to weights
+num_sims = 1000
+sigma = 2.0
+sens_percentile = 0.01
+
+sim_perf_percentiles, sim_perf = \
+    strat.PortfolioOptimizer.compute_signal_portfolio_sensitivity(
+        strategy=vd,
+        signals_data=vd_output.signal_output.signals_data,
+        weights=vd_output.weights,
+        num_sims=num_sims,
+        sigma=sigma,
+        signals_z_cap=signals_z_cap,
+        holding_period_days=holding_period_days,
+        vol_target_com=vol_target_com
+    )
+
+
+# Risk and return
+vd_output.combined_pnl.rolling(21).sum().std()
+vd_output.combined_pnl['optim_weight'].rolling(21).sum().iloc[21:].quantile(0.005)
+vd_output.combined_pnl_net.rolling(21).sum().mean()
+vd_output.combined_pnl_net.rolling(21).sum().mean() / vd_output.combined_pnl.rolling(21).sum().std() * np.sqrt(12)
+
+plt.figure()
+plt.plot(vd_output.combined_pnl_net['optim_weight'].cumsum(), color='k')
+plt.plot(sim_perf_percentiles.cumsum())
+plt.legend(['strategy', '1%', '10%', '25%', '50%', '75%', '90%', '99%'], loc=2)
+
+
+# Basic plot
+plt.figure()
+plt.plot(vd_output.combined_pnl_net['optim_weight'].cumsum())
+plt.ylabel('cumulative strategy PNL, in vegas of max position size')
+# plt.legend(['smart weighting', 'all signals equal weight'], loc=2)
+
+# Positioning plot
+plt.figure()
+pos_signals = ['vol_spec_pos', 'index_spec_pos',
+               'vol_spec_pos_chg_s', 'index_spec_pos_chg_s',
+               'vol_spec_pos_chg_l', 'index_spec_pos_chg_l']
+plt.plot(vd_output.signal_output.signal_pnl[pos_signals].cumsum())
+colormap = plt.get_cmap('coolwarm')
+plt.gca().set_color_cycle([colormap(i)
+                           for i in np.linspace(0, 0.9, len(pos_signals))])
+plt.legend(pos_signals, loc=2)
+plt.ylabel('cumulative strategy PNL, in vegas of max position size')
+
+# RV  plot
+plt.figure()
+rv_signals = ['rv_10', 'rv_21', 'rv_42', 'rv_63']
+colormap = plt.get_cmap('spectral')
+plt.gca().set_color_cycle([colormap(i)
+                           for i in np.linspace(0, 0.9, len(rv_signals))])
+plt.plot(vd_output.signal_output.signal_pnl[rv_signals].cumsum())
+plt.legend(rv_signals, loc=2)
+plt.ylabel('cumulative strategy PNL, in vegas of max position size')
+
+# TS plot
+plt.figure()
+ts_signals = ['ts_0', 'ts_1', 'ts_5', 'ts_10']
+colormap = plt.get_cmap('gist_heat')
+plt.gca().set_color_cycle([colormap(i)
+                           for i in np.linspace(0, 0.9, len(ts_signals))])
+plt.plot(vd_output.signal_output.signal_pnl[ts_signals].cumsum())
+plt.legend(ts_signals, loc=2)
+plt.ylabel('cumulative strategy PNL, in vegas of max position size')
+
+# Weights comparison plot
+plt.figure()
+plt.plot(vd_output.combined_pnl_net.cumsum())
+plt.ylabel('cumulative strategy PNL, in vegas of max position size')
+plt.legend(['smart weighting', 'all signals equal weight'], loc=2)
+
+# Signal robustness plot
+plt.figure()
+plt.plot(vd_output.combined_pnl_net.cumsum())
+plt.plot(sim_perf_percentiles.cumsum())
+cols = ['optim_weight', 'equal_weight'] + [str(c) for c in sim_perf_percentiles.columns]
+plt.legend(cols, loc=2)
+'''
+--------------------------------------------------------------------------------
+Evaluate predictiveness of past PNL for future PNL
+--------------------------------------------------------------------------------
+'''
+
+# TODO: we should be weighting these inversely by correlation to each other
+# Errors are no doubt correlated
+# GLS?
+
+# Here we're evaluating
+
+com = 252
+cap_z = 2.0
+
+pnl_horizon = 63
+com_range = [63, 126, 252, 512, 756, 1024]
+cap_z_range = [0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+
+pnl_pred_result = pd.DataFrame(index=com_range, columns=cap_z_range)
+
+for com in com_range:
+    for cap_z in cap_z_range:
+
+        pnl_pred_dataset = pd.DataFrame(calcs.windsorize(signal_pnl, cap_z)
+                                        .ewm(com=com)
+                                        .mean()
+                                        .shift(1)
+                                        .stack())
+
+        pnl_pred_dataset = pnl_pred_dataset.rename(columns={0: 'pnl_ewm_lag'})
+        pnl_pred_dataset['pnl'] = signal_pnl\
+                                    .rolling(window=pnl_horizon)\
+                                    .mean()\
+                                    .shift(pnl_horizon)\
+                                    .stack()
+
+        # Only finite obs
+        pnl_pred_dataset = pnl_pred_dataset[np.isfinite(pnl_pred_dataset)
+            .all(axis=1)]
+
+        # Filter out some noisy starting observations
+        pnl_pred_dataset = pnl_pred_dataset[
+            pnl_pred_dataset.index.get_level_values('date')
+            > start_date + BDay(21)]
+
+        pnl_pred_result.loc[com, cap_z] = \
+            pnl_pred_dataset['pnl'].corr(pnl_pred_dataset['pnl_ewm_lag'])
+
+
+'''
+--------------------------------------------------------------------------------
+Sensitivity analysis based on weights
+--------------------------------------------------------------------------------
+'''
+
+
+
+'''
+--------------------------------------------------------------------------------
+Can we fit a reasonable model to vol and stocks and use that to bootstrap
+--------------------------------------------------------------------------------
+'''
+
+
+
+'''
+--------------------------------------------------------------------------------
+ETF vol screen?
+--------------------------------------------------------------------------------
+'''
+
+tickers, exchange_codes = md.get_etf_universe()
+tickers = list(set(tickers) - set(['SHV', 'TIP', 'CIU', 'BKLN']))
+
+iv = md.get_equity_implied_volatility(tickers=tickers,
+                                      start_date=dt.datetime(2016, 9, 1))
+
+screen = iv['iv_3mc'] / (iv['tick_rv_20d'] * 0.5 + iv['tick_rv_60d'] * 0.5)
+screen = screen.sort_values()
 
 '''
 --------------------------------------------------------------------------------
@@ -863,7 +901,7 @@ f, f_res, out_grid, npd = macro.prepare_nonparametric_analysis(
 # Plotting
 ##############################################################################
 
-plot_start_date = dt.datetime(2010, 1, 1)
+plot_start_date = dt.datetime(2007, 1, 1)
 plot_ind = npd.index[npd.index >= plot_start_date]
 plot_data = npd.loc[plot_ind, ['ZF1M', 'ZLF1']]
 text_color_scheme = 'red'
@@ -894,8 +932,6 @@ plt.savefig('figures/macro.png',
 ##############################################################################
 # Plotting
 ##############################################################################
-
-from mpl_toolkits.mplot3d import Axes3D
 
 currentDate = npd.index[len(npd.index)-1]
 currentLevel = npd['ZF1M'][currentDate]
@@ -1011,8 +1047,9 @@ import simplejson as json
 
 barchart_api = "getQuote"
 return_format = "json"
-req_url = "http://marketdata.websol.barchart.com/getQuote.json?key=5c45079e0956acbcf33925204ee4846a&symbols=VIQ16"
-
+req_url = "http://marketdata.websol.barchart.com/getQuote.json?key="
+req_url += barchart.API_KEY
+req_url += "&symbols=VIQ16"
 
 response = urllib2.urlopen(req_url)
 results_dict = json.loads(response.read())

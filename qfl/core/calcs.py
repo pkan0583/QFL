@@ -2,6 +2,7 @@ import pandas as pd
 import datetime as dt
 import numpy as np
 from scipy.stats import norm, expon, gamma, invgamma, beta, nct
+from scipy.stats import t, normaltest
 from scipy.stats import multivariate_normal, wishart, invwishart, dirichlet
 from scipy.stats import bernoulli
 from scipy import interpolate
@@ -9,6 +10,31 @@ import pymc
 import matplotlib.pyplot as plt
 import qfl.utilities.basic_utilities as utils
 import qfl.core.constants as constants
+
+
+def windsorize(df=None, z=2.0):
+
+    df = df.copy(deep=True)
+    df_sd = df.std()
+    if isinstance(df, pd.DataFrame):
+        for col in df.columns:
+
+            ind = df.index[df[col] > z * df_sd[col]]
+            df.loc[ind, col] = z * df_sd[col]
+
+            ind = df.index[df[col] < -z * df_sd[col]]
+            df.loc[ind, col] = -z * df_sd[col]
+    elif isinstance(df, pd.Series):
+        df[df > z * df_sd] = z * df_sd
+        df[df < -z * df_sd] = -z * df_sd
+    return df
+
+
+def compute_uncertainty_adj_portfolio(**kwargs):
+
+    er = kwargs.get('expected_return_mean', None)
+    volr = kwargs.get('return_covariance', None)
+    er_sd = kwargs.get('expected_return_covariance', None)
 
 
 def compute_seasonality_adj_vol_futures_prices(futures_data=None,
@@ -34,6 +60,12 @@ def compute_seasonality_adj_vol_futures_prices(futures_data=None,
     :param december_effect_vol_points: additional adjustment for December
     :return:
     """
+
+    # Ensure appropriate formatting
+    futures_contracts['maturity_date'] \
+        = pd.to_datetime(futures_contracts['maturity_date'])
+    futures_data['maturity_date'] \
+        = pd.to_datetime(futures_data['maturity_date'])
 
     # Get appropriate calendar (TODO: replace)
     calendar_name = 'UnitedStates'
@@ -63,7 +95,9 @@ def compute_seasonality_adj_vol_futures_prices(futures_data=None,
 
     futures_data['december'] = futures_data['maturity_date'].dt.month == 12
     ind = futures_data.index[futures_data['december'] == True]
-    futures_data.loc[ind, 'seasonality_adj_price'] += december_effect_vol_points
+    if len(ind) > 0:
+        futures_data.loc[ind, 'seasonality_adj_price'] \
+            += december_effect_vol_points
     return futures_data
 
 
@@ -127,26 +161,156 @@ def compute_constant_maturity_futures_prices(generic_futures_data=None,
         date = dates[t]
 
         ind = (np.isfinite(futures_ttm.loc[date])) \
-              & (np.isfinite(generic_futures_prices.loc[date]))
+                  & (np.isfinite(generic_futures_prices.loc[date]))
 
         interp_values = generic_futures_prices.loc[date][ind]
 
         if volatilities:
             interp_values **= 2.0
 
-        f = interpolate.interp1d(x=futures_ttm.loc[date][ind],
-                                 y=interp_values,
-                                 kind='linear',
-                                 fill_value='extrapolate',
-                                 bounds_error=False)
+        try:
+            f = interpolate.interp1d(x=futures_ttm.loc[date][ind],
+                                     y=interp_values,
+                                     kind='linear',
+                                     fill_value='extrapolate',
+                                     bounds_error=False)
 
-        constant_maturity_futures_prices.loc[date] \
-            = f(constant_maturities_in_days)
+            constant_maturity_futures_prices.loc[date] \
+                = f(constant_maturities_in_days)
+        except:
+            x=1
 
     if volatilities:
         constant_maturity_futures_prices **= 0.5
 
     return constant_maturity_futures_prices
+
+
+def clean_implied_vol_data(tickers=None,
+                           stock_prices=None,
+                           ivol=None,
+                           ref_ivol_ticker=None,
+                           res_com=5,
+                           deg_f=2,
+                           buffer_days=3,
+                           pct_threshold=0.0001,
+                           calendar_name='UnitedStates'):
+
+    ivol = ivol.copy(deep=True)
+    clean_ivol = pd.DataFrame(index=ivol.index, columns=ivol.columns)
+    normal_tests = pd.DataFrame(index=tickers, columns=['stat'])
+
+    for ticker in tickers:
+
+        print(ticker)
+
+        try:
+
+            riv = ivol[ref_ivol_ticker]
+            if ref_ivol_ticker == ticker:
+                riv = None
+
+            clean_ivol_tmp, tmp_pr, r1 = _clean_implied_vol_data_one(
+                stock_prices=stock_prices[ticker],
+                ivol=ivol[ticker],
+                ref_ivol=riv,
+                pct_threshold=pct_threshold,
+                buffer_days=buffer_days,
+                res_com=res_com,
+                deg_f=deg_f)
+
+            clean_ivol[ticker], tmp_pr_, r1_ = _clean_implied_vol_data_one(
+                stock_prices=stock_prices[ticker],
+                ivol=clean_ivol_tmp,
+                ref_ivol=riv,
+                pct_threshold=pct_threshold,
+                buffer_days=buffer_days,
+                res_com=res_com,
+                deg_f=deg_f)
+
+            normal_tests.loc[ticker, 'stat'] = normaltest(r1.resid).statistic
+
+        except:
+            print('failed!')
+
+    return clean_ivol, normal_tests
+
+
+def _clean_implied_vol_data_one(stock_prices=None,
+                                ivol=None,
+                                ref_ivol=None,
+                                res_com=5,
+                                deg_f=2,
+                                buffer_days=3,
+                                pct_threshold=0.0001,
+                                calendar_name='UnitedStates'):
+
+    ivol = ivol.copy(deep=True)
+
+    df = pd.DataFrame(index=ivol.index,
+                      columns=['px', 'ivol', 'ret', 'ivol_chg'])
+    df['px'] = stock_prices
+    df['ivol'] = ivol
+    df = df[np.isfinite(df['px'])]
+    df['ret'] = df['px'] / df['px'].shift(1) - 1
+    df['ivol_chg'] = df['ivol'] / df['ivol'].shift(1) - 1
+
+    # Idea is that first we should predict ivol change based on stock chg
+    # And then we should filter outliers from there
+
+    x = df['ret']
+    if ref_ivol is not None:
+        df['ref_ivol_chg'] = ref_ivol
+        x = df[['ret', 'ref_ivol_chg']]
+    r1 = pd.ols(y=df['ivol_chg'], x=x)
+    df['ivol_chg_res'] = r1.resid
+
+    # Now... an outlier is a large unexpected change in ivol
+    # And it's "post facto" an outlier if it then reverts back
+
+    # So "probability of being an outlier" is some function of a large residual
+    # followed by negative residuals
+
+    df['ivol_chg_res_fwd_ewm'] = df['ivol_chg_res'] \
+                                     .iloc[::-1] \
+                                     .ewm(com=res_com) \
+                                     .mean() \
+                                     .iloc[::-1] \
+                                     .shift(-1) \
+                                     * res_com
+
+    max_date = np.max(df.index)
+    df['ivol_chg_res_fwd_ewm'].loc[max_date] = 0
+
+    tmp = df[['ivol_chg_res', 'ivol_chg_res_fwd_ewm']]
+    tmpz = (tmp - tmp.mean()) / tmp.std()
+
+    # Identify potential outliers
+    from scipy.stats import t
+    tmp_pr = t.pdf(tmpz['ivol_chg_res'], deg_f) \
+             * t.pdf(tmpz['ivol_chg_res_fwd_ewm'], deg_f)
+    tmp_pr = pd.DataFrame(data=tmp_pr, index=tmpz.index, columns=['tmp_pr'])
+    tmp_pr_f = tmp_pr[tmp_pr['tmp_pr'] < pct_threshold]
+
+    if len(tmp_pr_f) == 0:
+        return ivol, tmp_pr, r1
+
+    # Separate these into blocks
+    tmp_pr_f['block'] = 0
+    tmp_pr_f.loc[tmp_pr_f.index[0], 'block'] = 1
+    dates = tmp_pr_f.index.get_level_values('date')
+    for t in range(1, len(tmp_pr_f)):
+        if dates[t] <= utils.workday(date=dates[t - 1],
+                                     num_days=buffer_days,
+                                     calendar_name=calendar_name):
+            tmp_pr_f.loc[dates[t], 'block'] = tmp_pr_f.loc[dates[t-1], 'block']
+        else:
+            tmp_pr_f.loc[dates[t], 'block'] = tmp_pr_f.loc[
+                                                dates[t-1], 'block'] + 1
+
+    # NAN out that stuff
+    ivol.loc[tmp_pr_f.index] = np.nan
+    return ivol, tmp_pr, r1
 
 
 def garman_klass_volatility(prices=None):
@@ -255,3 +419,143 @@ def linear_setup(df, ind_cols, dep_col):
 
     return pymc.Model(
         [b0, pymc.Container(b), err, pymc.Container(x), y, y_pred])
+
+
+'''
+--------------------------------------------------------------------------------
+Volatility swaps
+--------------------------------------------------------------------------------
+'''
+
+
+def volswap_market_value(iv=None,
+                         rv=None,
+                         strike=None,
+                         days_elapsed=None,
+                         total_days=None,
+                         date=None,
+                         start_date=None,
+                         maturity_date=None,
+                         calendar_name='UnitedStates'):
+
+    # If maturity date and trade date are provided, those take precedence
+    if start_date is not None and maturity_date is not None and date is not None:
+        days_to_maturity, days_elapsed, total_days \
+            = utils.get_days_from_maturity(
+                start_date=start_date,
+                maturity_date=maturity_date,
+                date=date,
+                calendar_name=calendar_name)
+
+    # Weighted average of implied and realized
+    rlzd_weight = float(days_elapsed) / total_days
+
+    ev = (iv ** 2 * (1 - rlzd_weight) + rv ** 2 * rlzd_weight) ** 0.5
+    return ev - strike
+
+
+def volswap_daily_pnl(daily_return=None,
+                      iv=None,
+                      rv=None,
+                      strike=None,
+                      days_elapsed=None,
+                      total_days=None,
+                      date=None,
+                      start_date=None,
+                      maturity_date=None,
+                      calendar_name='UnitedStates'):
+
+    """
+    This calculates the (gamma-theta-only) daily PNL of a volswap
+    It assumes no change in IV (obviously can extend)
+    :param daily_return:
+    :param iv:
+    :param rv:
+    :param strike:
+    :param days_elapsed:
+    :param total_days:
+    :param date:
+    :param start_date:
+    :param maturity_date:
+    :param calendar_name:
+    :return: double or DataFrame
+    """
+
+    # If maturity date and trade date are provided, those take precedence
+    if start_date is not None and maturity_date is not None and date is not None:
+        days_to_maturity, days_elapsed, total_days \
+            = utils.get_days_from_maturity(
+                start_date=start_date,
+                maturity_date=maturity_date,
+                date=date,
+                calendar_name=calendar_name)
+        if start_date > date:
+            if utils.is_iterable(iv):
+                theta = pd.DataFrame(index=iv.index, columns=['theta'])
+                theta['theta'] = 0
+            else:
+                theta = 0
+            return theta
+
+    mv_0 = volswap_market_value(iv=iv,
+                                rv=rv,
+                                strike=strike,
+                                days_elapsed=days_elapsed,
+                                total_days=total_days,
+                                calendar_name=calendar_name)
+
+    rv_1 = (days_elapsed / (days_elapsed + 1) * rv ** 2
+         + constants.trading_days_per_year * daily_return ** 2) ** 0.5
+
+    mv_1 = volswap_market_value(iv=iv,
+                                rv=rv_1,
+                                strike=strike,
+                                days_elapsed=days_elapsed + 1,
+                                total_days=total_days,
+                                calendar_name=calendar_name)
+
+    pnl = mv_1 - mv_0
+    return pnl
+
+
+def volswap_gamma(iv=None,
+                  rv=None,
+                  strike=None,
+                  days_elapsed=None,
+                  total_days=None,
+                  date=None,
+                  start_date=None,
+                  maturity_date=None,
+                  calendar_name='UnitedStates'):
+
+    x=1
+
+
+def volswap_theta(iv=None,
+                  rv=None,
+                  strike=None,
+                  days_elapsed=None,
+                  total_days=None,
+                  date=None,
+                  start_date=None,
+                  maturity_date=None,
+                  calendar_name='UnitedStates'):
+
+    if utils.is_iterable(iv):
+        daily_return = pd.DataFrame(index=rv.index, columns=['returns'])
+        daily_return['returns'] = 0
+        daily_return = daily_return['returns']
+    else:
+        daily_return = 0
+
+    theta = volswap_daily_pnl(daily_return=daily_return,
+                              iv=iv,
+                              rv=rv,
+                              strike=strike,
+                              days_elapsed=days_elapsed,
+                              total_days=total_days,
+                              date=date,
+                              start_date=start_date,
+                              maturity_date=maturity_date,
+                              calendar_name=calendar_name)
+    return theta

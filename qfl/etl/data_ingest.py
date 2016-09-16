@@ -3,23 +3,24 @@ This module should ideally be ONLY tasked with the automation and triggering of
 ETL tasks and should rely on other modules to actually implement those tasks?
 EG, we shouldn't need references here to YahooApi...
 """
-import os
-import pandas as pd
 import datetime as dt
-import numpy as np
-from pandas.tseries.offsets import BDay
 import logging
+import os
+import time
 
-import qfl.core.data_interfaces as qfl_data
-import qfl.utilities.basic_utilities as utils
-from qfl.core.data_interfaces import YahooApi, QuandlApi, FigiApi, DataScraper
-from qfl.core.database_interface import DatabaseInterface as db, \
-                                        DatabaseUtilities as dbutils
+import numpy as np
+import odo
+import pandas as pd
+from pandas.tseries.offsets import BDay
+
+import qfl.core.calcs as calcs
 import qfl.core.constants as constants
 import qfl.core.market_data as md
-import qfl.core.calcs as calcs
-import time
-import odo
+import qfl.etl.data_interfaces as qfl_data
+import qfl.utilities.basic_utilities as utils
+from qfl.core.database_interface import DatabaseInterface as db, \
+                                        DatabaseUtilities as dbutils
+from qfl.etl.data_interfaces import YahooApi, QuandlApi, FigiApi, DataScraper
 
 # Default start date for historical data ingests
 default_start_date = dt.datetime(1990, 1, 1)
@@ -159,6 +160,26 @@ class StandardDataIngest(DataIngest):
         end_date = date
         cls.expected_datestamp = date
         return start_date, end_date
+
+
+class DailyGenericIndexPriceIngest(StandardDataIngest):
+
+    name = "Daily Generic Index Price Ingest"
+    expected_datestamp = None
+    table_name = 'generic_index_prices'
+    check_non_null_column_name = 'last_price'
+    pass_rows_threshold = 2
+    data_source_name = 'multiple'
+    prev_day = True
+
+    @classmethod
+    def ingest_data(cls,
+                    start_date=None,
+                    end_date_=None,
+                    data_source_name='multiple',
+                    **kwargs):
+
+        ingest_historical_volatility_index_prices(start_date=start_date)
 
 
 class DailyEquityIndexPriceIngest(StandardDataIngest):
@@ -521,7 +542,6 @@ def update_equity_prices(ids=None,
 
     ingest_historical_equity_prices(ids=ids,
                                     start_date=date,
-                                    end_date=date,
                                     data_source=data_source_name,
                                     batch=True,
                                     batch_size=batch_size)
@@ -614,7 +634,7 @@ def ingest_historical_equity_prices(ids=None,
             logging.info("archiving batch " + str(i)
                          + " out of " + str(len(ids)))
 
-            if batch_size == 1:
+            if len(ids) == 1 or batch_size == 1:
                 batch_ids = [ids[lrange]]
             else:
                 batch_ids = ids[lrange:urange]
@@ -886,6 +906,24 @@ EQUITY IMPLIED VOLATILITIES
 """
 
 
+def process_historical_orats_data(tickers=None):
+
+    if tickers is None:
+
+        d = db.read_sql("select distinct id, ticker from staging_orats")
+        tickers = [str(t) for t in d['ticker'].values.tolist()]
+        tickers.index = tickers['id']
+
+    for ticker in tickers:
+
+        data = md.get_equity_implied_volatility(tickers=[ticker],
+                                                start_date=default_start_date)
+
+        data['equity_id'] = tickers.loc[ticker, 'id']
+
+        x=1
+
+
 def ingest_historical_orats_data(full_history=False):
 
     data = QuandlApi.get_orats_data(full_history=full_history)
@@ -1083,6 +1121,38 @@ def process_optionworks_series():
         db.execute_db_save(df=df, table=table, extra_careful=False)
 
 
+def impute_futures_maturity_dates_from_optionworks(futures_contract_tickers=None):
+
+    # Update futures maturity dates from optionworks
+    ow_series = db.get_data(table_name='futures_series_identifiers',
+                            where_str="source = 'optionworks'")
+    ows = tuple(ow_series['series_id'].values)
+
+    where_str = "  series_id in {0}".format(ows)
+    if futures_contract_tickers is not None:
+        where_str += " and ticker in {0}".format(
+            dbutils.format_for_query(futures_contract_tickers))
+
+    fc = db.get_data(table_name='futures_contracts', where_str=where_str)
+
+    s = " select distinct on(futures_contract)" \
+        " date, futures_contract, dtt " \
+        " from futures_ivol_fixed_maturity_surface_model "
+    d = db.read_sql(s)
+
+    df = pd.merge(left=fc,
+                  right=d,
+                  left_on='ticker',
+                  right_on='futures_contract')
+    df['imputed_maturity_date'] = pd.to_datetime(df['date']) \
+                                  + pd.TimedeltaIndex(df['dtt'], unit='D')
+    df['maturity_date'] = df['imputed_maturity_date']
+    df = df[['id', 'series_id', 'ticker', 'maturity_date']]
+
+    table = db.get_table('futures_contracts')
+    db.execute_db_save(df=df, table=table)
+
+
 def process_all_optionworks_data(start_date=default_start_date):
 
     # This gets the master list of optionworks series that we have mapped
@@ -1090,11 +1160,13 @@ def process_all_optionworks_data(start_date=default_start_date):
                     " where source = 'optionworks' ")
     ow_series = d['source_id'].values.tolist()
     series_ids = d['series_id'].values.tolist()
+    ow_series = [str(s) for s in ow_series]
 
-    s = 'select distinct futures_series from optionworks_codes ' \
-        'where ow_series_id in {0}'.format(ow_series)
-    d = db.read_sql(s)
-    d = [str(d_) for d_ in d['futures_series'].values]
+    # s = 'select distinct futures_series from optionworks_codes ' \
+    #     'where ow_series_id in {0}'.format(
+    #         dbutils.format_for_query(ow_series))
+    # d = db.read_sql(s)
+    # d = [str(d_) for d_ in d['futures_series'].values]
 
     counter = 0
     for series_id in series_ids:
@@ -1170,8 +1242,13 @@ def preprocess_optionworks_data(series_id=None,
         " order by days_to_maturity asc ")
     codes = [str(code) for code in e['ow_code'].values.tolist()]
 
+    # If we don't find anything, oops return
+    if len(codes) == 0:
+        logging.info("no matching codes found!")
+        return None, None
+
     # Get the actual implied volatility data
-    s = 'code in {0}'.format(dbutils.format_as_tuple_for_query(codes)) + \
+    s = 'code in {0}'.format(dbutils.format_for_query(codes)) + \
         " and date >= '{0}'".format(start_date)
     data = db.get_data(table_name=source_table_name,
                        where_str=s)
@@ -1210,6 +1287,11 @@ def process_optionworks_data_ivs(series_id=None,
         source_table_name=source_table_name,
         target_table_name=target_table_name,
         start_date=start_date)
+
+    if df is None:
+        w = "warning: did not find OW " + str(series_id) + " data to process!"
+        logging.warn(w)
+        return
 
     ow_ivs_cols = QuandlApi.get_optionworks_ivs_cols()
     call_cols = [s.lower() for s in ow_ivs_cols
@@ -1260,6 +1342,10 @@ def process_optionworks_data_ivm(series_id=None,
         target_table_name=target_table_name,
         start_date=start_date)
 
+    # Failed to find data
+    if df is None:
+        return
+
     df = df[target_table.columns.keys()]
     df['date'] = pd.to_datetime(df['date'])
 
@@ -1269,9 +1355,17 @@ def process_optionworks_data_ivm(series_id=None,
                        time_series=True)
 
 
-def ingest_optionworks_data(full_history=False):
+def ingest_optionworks_data(full_history=False, start_date=None):
 
+    """
+
+    :rtype: object
+    """
     data_ivm, data_ivs = QuandlApi.get_optionworks_data(full_history)
+
+    if start_date is not None:
+        data_ivm = data_ivm[data_ivm['date'] >= start_date]
+        data_ivs = data_ivs[data_ivs['date'] >= start_date]
 
     table_name_ivm = "staging_optionworks_ivm"
     table_name_ivs = "staging_optionworks_ivs"
@@ -1281,7 +1375,7 @@ def ingest_optionworks_data(full_history=False):
     latest_date = pd.to_datetime(d['max'].values[0])
     retrieve_date = data_ivm['date'].max()
 
-    if retrieve_date <= latest_date:
+    if start_date is None and retrieve_date <= latest_date:
         logging.info("Retrieval date is on or before existing data!")
         return
 
@@ -1290,11 +1384,17 @@ def ingest_optionworks_data(full_history=False):
         data_ivm = data_ivm[data_ivm['date'] == retrieve_date]
         data_ivs = data_ivs[data_ivs['date'] == data_ivs['date'].max()]
 
-    database_table_path = db.connection_string + "::" + table_name_ivm
-    odo.odo(data_ivm, database_table_path)
+    table = db.get_table(table_name_ivm)
+    db.execute_db_save(df=data_ivm, table=table, time_series=True)
 
-    database_table_path = db.connection_string + "::" + table_name_ivs
-    odo.odo(data_ivs, database_table_path)
+    table = db.get_table(table_name_ivs)
+    db.execute_db_save(df=data_ivs, table=table, time_series=True)
+
+    # database_table_path = db.connection_string + "::" + table_name_ivm
+    # odo.odo(data_ivm, database_table_path)
+    #
+    # database_table_path = db.connection_string + "::" + table_name_ivs
+    # odo.odo(data_ivs, database_table_path)
 
 
 """
@@ -1388,9 +1488,11 @@ def ingest_cftc_positioning_data(category=None, full_history=False):
     table_name = "staging_cftc_positioning_" + category
 
     if category == "commodity":
-        data = DataScraper.retrieve_cftc_commodity_positioning_data(full_history)
+        data = DataScraper.retrieve_cftc_commodity_positioning_data(
+            full_history=full_history)
     elif category == "financial":
-        data = DataScraper.retrieve_cftc_financial_positioning_data(full_history)
+        data = DataScraper.retrieve_cftc_financial_positioning_data(
+            full_history=full_history)
 
     for col in data.columns:
         data = data.rename(columns={col: col.lower()})
@@ -1416,21 +1518,25 @@ VOLATILITY INDICES
 """
 
 
-def ingest_historical_volatility_index_prices():
+def ingest_historical_volatility_index_prices(start_date=default_start_date):
+
+    # Take start-date back a few days to ensure all data found
+    start_date = start_date - 5 * BDay()
 
     table = db.get_table('generic_index_prices')
 
     # VIX
-    data = YahooApi.retrieve_prices("^VIX", default_start_date)
+    data = YahooApi.retrieve_prices("^VIX", start_date)
     data = data.reset_index()
     data = data.rename(columns={'Date': 'date'})
     s = "select id from generic_indices where ticker = 'VIX'"
     id = db.read_sql(s).iloc[0].values[0]
     data['id'] = id
-    db.execute_db_save(df=data,
-                       table=table,
-                       extra_careful=False,
-                       time_series=True)
+    if len(data) > 0:
+        db.execute_db_save(df=data,
+                           table=table,
+                           extra_careful=False,
+                           time_series=True)
 
     # V2X
     data = DataScraper.retrieve_vstoxx_historical_prices()
@@ -1438,21 +1544,23 @@ def ingest_historical_volatility_index_prices():
     id = db.read_sql(s).iloc[0].values[0]
     data['id'] = id
     del data['ticker']
-    db.execute_db_save(df=data,
-                       table=table,
-                       extra_careful=False,
-                       time_series=True)
+    if len(data) > 0:
+        db.execute_db_save(df=data,
+                           table=table,
+                           extra_careful=False,
+                           time_series=True)
 
     # SKEW
-    data = QuandlApi.get('CBOE/SKEW', default_start_date).reset_index()
+    data = QuandlApi.get('CBOE/SKEW', start_date).reset_index()
     s = "select id from generic_indices where ticker = 'SKEW'"
     id = db.read_sql(s).iloc[0].values[0]
     data['id'] = id
     data = data.rename(columns={'SKEW': 'last_price', 'Date': 'date'})
-    db.execute_db_save(df=data,
-                       table=table,
-                       extra_careful=False,
-                       time_series=True)
+    if len(data) > 0:
+        db.execute_db_save(df=data,
+                           table=table,
+                           extra_careful=False,
+                           time_series=True)
 
 
 def add_volatility_futures_series():
@@ -1580,6 +1688,7 @@ def add_futures_series():
 
 
 def ingest_historical_generic_futures_prices(futures_series=None,
+                                             exchange_code=None,
                                              source_series=None,
                                              contract_range=None,
                                              dataset=None,
@@ -1603,10 +1712,11 @@ def ingest_historical_generic_futures_prices(futures_series=None,
         table_name='generic_futures_contracts')
     contracts_retrieved = pd.DataFrame(futures_data.groupby('ticker')
                                        .last()['contract_number'])
-    futures_series_data = db.get_data(table_name='futures_series')
-    ind = futures_series_data.index[
-        futures_series_data['series'] == futures_series]
-    series_id = futures_series_data.loc[ind, 'id'].values[0]
+
+    futures_series_data = db.get_futures_series(futures_series=futures_series,
+                                                exchange_code=exchange_code)
+
+    series_id = futures_series_data['id'].values[0]
     contracts_retrieved['series_id'] = series_id
     contracts_retrieved = contracts_retrieved.reset_index()
 
@@ -1617,20 +1727,6 @@ def ingest_historical_generic_futures_prices(futures_series=None,
 
     # Prices
     futures_prices_table = db.get_table(table_name='generic_futures_prices')
-
-    if 'Prev. Day Open Interest' in futures_data.columns:
-        futures_data['open_interest'] = \
-            futures_data['Prev. Day Open Interest'].shift(-1)
-    elif 'Open Interest' in futures_data.columns:
-        futures_data['open_interest'] = futures_data['Open Interest']
-
-    rename_cols = {'Close': 'close_price',
-                   'High': 'high_price',
-                   'Low': 'low_price',
-                   'Open': 'open_price',
-                   'Settle': 'settle_price',
-                   'Total Volume': 'volume'}
-    futures_data = futures_data.rename(columns=rename_cols)
 
     # Filter for valid prices
     futures_data = futures_data[
@@ -1647,7 +1743,7 @@ def ingest_historical_generic_futures_prices(futures_series=None,
         if col not in futures_prices_table.columns.keys():
             del final_data[col]
 
-    final_data = final_data.fillna(value=constants.invalid_value)
+    final_data = utils.replace_nan_with_none(final_data)
 
     result = db.execute_db_save(df=final_data,
                                 table=futures_prices_table,
@@ -1666,8 +1762,7 @@ def precompute_seasonality_adjusted_vol_futures_prices(futures_series=None,
 
     generic_futures_data = md.get_generic_futures_prices_by_series(
         futures_series=futures_series,
-        start_date=start_date,
-        include_contract_map=True)
+        start_date=start_date)
 
     # VIX-specific logic for adjusting calendar day-count conventions
     futures_contracts = md.get_futures_contracts_by_series(futures_series)
@@ -1686,11 +1781,12 @@ def precompute_seasonality_adjusted_vol_futures_prices(futures_series=None,
         ['id', 'seasonality_adj_price']].reset_index()
     del futures_prices_to_update['ticker']
 
-    table = db.get_table('generic_futures_prices')
-    db.execute_db_save(df=futures_prices_to_update,
-                       table=table,
-                       extra_careful=False,
-                       time_series=True)
+    if len(futures_prices_to_update) > 0:
+        table = db.get_table('generic_futures_prices')
+        db.execute_db_save(df=futures_prices_to_update,
+                           table=table,
+                           extra_careful=False,
+                           time_series=True)
 
     # Now do standard futures time series data
     futures_prices_by_contract = md.get_futures_prices_by_series(
@@ -1712,11 +1808,12 @@ def precompute_seasonality_adjusted_vol_futures_prices(futures_series=None,
     futures_prices_by_contract = futures_prices_by_contract[
         ['id', 'date', 'seasonality_adj_price']]
 
-    table = db.get_table('futures_prices')
-    db.execute_db_save(df=futures_prices_by_contract,
-                       table=table,
-                       extra_careful=False,
-                       time_series=True)
+    if len(futures_prices_by_contract) > 0:
+        table = db.get_table('futures_prices')
+        db.execute_db_save(df=futures_prices_by_contract,
+                           table=table,
+                           extra_careful=False,
+                           time_series=True)
 
 
 def precompute_constant_maturity_futures_prices(futures_series=None,
@@ -1728,8 +1825,7 @@ def precompute_constant_maturity_futures_prices(futures_series=None,
 
     generic_futures_data = md.get_generic_futures_prices_by_series(
         futures_series=futures_series,
-        start_date=start_date,
-        include_contract_map=True)
+        start_date=start_date)
 
     cmfp = calcs.compute_constant_maturity_futures_prices(
         generic_futures_data=generic_futures_data,
@@ -1745,6 +1841,10 @@ def precompute_constant_maturity_futures_prices(futures_series=None,
 
     cmfp['series_id'] = db.get_futures_series(futures_series).iloc[0]['id']
 
+    if len(cmfp) == 0:
+        logging.info("No data to archive!")
+        return
+
     table = db.get_table('constant_maturity_futures_prices')
 
     db.execute_db_save(df=cmfp,
@@ -1757,18 +1857,52 @@ def precompute_historical_futures_days_to_maturity(futures_series=None,
                                                    start_date=None,
                                                    generic=False):
 
-    # Retreive the basic data
+    # These are neede for the map either way
+    futures_prices = md.get_generic_futures_prices_by_series(
+        futures_series=futures_series,
+        start_date=start_date,
+        mapped_view=False)
+
+    # Get contract map (it's going to be empty for new stuff)
+    contract_map, futures_contracts = md.get_futures_generic_contract_map(
+        futures_series=futures_series,
+        futures_prices=futures_prices,
+        price_field='settle_price',
+        start_date=start_date)
+
     if generic:
         table_name = 'generic_futures_prices'
-        futures_prices = md.get_generic_futures_prices_by_series(
-            futures_series=futures_series,
-            start_date=start_date,
-            include_contract_map=True)
     else:
         table_name = 'futures_prices'
         futures_prices = md.get_futures_prices_by_series(
             futures_series=futures_series,
             start_date=start_date)
+
+    if len(futures_prices) == 0:
+        return
+
+    # Overwrite contract ticker and maturity date
+    futures_contracts = futures_contracts.rename(columns={'ticker':
+                                                          'contract_ticker'})
+
+    contract_map = pd.DataFrame(contract_map.stack(level='ticker'),
+                                columns=['contract_ticker'])
+
+    contract_map = pd.merge(left=contract_map.reset_index(),
+                            right=futures_contracts,
+                            on='contract_ticker')
+
+    if len(contract_map) == 0:
+        logging.info("Could not find any matching contracts!")
+        return
+
+    cols = ['contract_ticker', 'maturity_date', 'futures_contract_id']
+    if not generic:
+        del contract_map['ticker']
+        contract_map = contract_map.rename(columns={'contract_ticker': 'ticker'})
+        cols = ['maturity_date', 'futures_contract_id']
+    contract_map = contract_map.set_index(['date', 'ticker'])
+    futures_prices[cols] = contract_map[cols]
 
     # Retrieve the series and the holiday calendar
     calendar_name = md.get_futures_calendar_name(futures_series)
@@ -1777,10 +1911,10 @@ def precompute_historical_futures_days_to_maturity(futures_series=None,
     start_dates = futures_prices.index.get_level_values('date')
     end_dates = futures_prices['maturity_date'].values
     futures_prices['days_to_maturity'] = utils.networkdays(
-        start_date=start_dates,
-        end_date=end_dates,
-        calendar_name=calendar_name
-    )
+            start_date=start_dates,
+            end_date=end_dates,
+            calendar_name=calendar_name)
+
 
     # Keep only futures prices columns
     table = db.get_table(table_name)
@@ -1801,6 +1935,7 @@ def ingest_historical_futures_universe():
     contract_range = range(1, 10)
 
     for i in range(0, len(df)):
+
         futures_series = df.loc[i, 'futures_series']
         contracts_dataset = df.loc[i, 'contracts_dataset']
         generic_dataset = df.loc[i, 'generic_dataset']
@@ -1834,49 +1969,15 @@ def ingest_historical_futures_universe():
             generic=True)
 
 
-def load_historical_generic_vix_futures_prices():
+def ingest_futures_contracts(futures_series=None,
+                             futures_data=None):
 
-    dataset = 'CHRIS'
-    futures_series = 'VX'
-    source_series = 'CBOE_VX'
-
-    ingest_historical_generic_futures_prices(dataset=dataset,
-                                             futures_series=futures_series,
-                                             source_series=source_series)
-
-
-def load_historical_vix_futures_prices():
-
-    dataset = 'CBOE'
-    futures_series = 'VX'
-    start_date = dt.datetime(2007, 3, 24)
-
-    ingest_historical_futures_prices(dataset=dataset,
-                                     futures_series=futures_series,
-                                     start_date=start_date)
-
-
-def ingest_historical_futures_prices(dataset=None,
-                                     futures_series=None,
-                                     start_date=default_start_date):
-
-    # Need logic to identify data sources etc
-    # Also the transform below could ideally be moved
-
-    # Get series
-    tmp = db.get_futures_series(futures_series)
-    contract_months = list(tmp['delivery_months'].values[0])
-    contract_months = [str(code) for code in contract_months]
-
-    # Get the big dataset
-    futures_data = qfl_data.QuandlApi.retrieve_historical_futures_prices(
-        start_date=start_date,
-        futures_series=futures_series,
-        dataset=dataset,
-        contract_months_list=contract_months)
-    futures_data.index.names = ['ticker', 'date']
-
-    # Update our contract table
+    """
+    This works from futures data
+    :param futures_series: string
+    :param futures_data: DataFrame with fields 'ticker', 'date'
+    :return:
+    """
 
     # Get expiration dates: note this only works for expired contracts
     futures_contracts_retrieved = futures_data.reset_index() \
@@ -1886,6 +1987,14 @@ def ingest_historical_futures_prices(dataset=None,
         futures_contracts_retrieved).reset_index()
     futures_contracts_retrieved = futures_contracts_retrieved.rename(
         columns={'date': 'maturity_date'})
+
+    # Invalidate maturity date for non-expired contracts
+    current_date = dt.datetime.today()
+    cutoff_date = current_date - 5 * BDay()
+    ind = futures_contracts_retrieved.index[
+        futures_contracts_retrieved['maturity_date'] > cutoff_date]
+    futures_contracts_retrieved.loc[ind, 'maturity_date']\
+        = constants.invalid_date
 
     # Map to appropriate id
     futures_series_data = db.get_data(table_name='futures_series')
@@ -1902,24 +2011,38 @@ def ingest_historical_futures_prices(dataset=None,
                        table=futures_contracts_table,
                        use_column_as_key='ticker')
 
+
+def ingest_historical_futures_prices(dataset=None,
+                                     futures_series=None,
+                                     start_date=default_start_date,
+                                     end_date=dt.datetime.today(),
+                                     add_contracts=False):
+
+    # Need logic to identify data sources etc
+
+    # Get series
+    tmp = db.get_futures_series(futures_series)
+    contract_months = list(tmp['delivery_months'].values[0])
+    contract_months = [str(code) for code in contract_months]
+
+    # Get the big dataset
+    futures_data = qfl_data.QuandlApi.retrieve_historical_futures_prices(
+        start_date=start_date,
+        end_date=end_date,
+        futures_series=futures_series,
+        dataset=dataset,
+        contract_months_list=contract_months)
+    futures_data.index.names = ['ticker', 'date']
+
+    # Update our contract table
+    if add_contracts:
+        ingest_futures_contracts(futures_series=futures_series,
+                                 futures_data=futures_data)
+
     # Prices
     futures_prices_table = db.get_table(table_name='futures_prices')
     futures_data = futures_data.reset_index()
-
-    if 'Prev. Day Open Interest' in futures_data.columns:
-        futures_data['open_interest'] = \
-            futures_data['Prev. Day Open Interest'].shift(-1)
-    rename_cols = {'Close': 'close_price',
-                   'High': 'high_price',
-                   'Low': 'low_price',
-                   'Open': 'open_price',
-                   'Settle': 'settle_price',
-                   'Total Volume': 'volume'}
-    futures_data = futures_data.rename(columns=rename_cols)
-
-    # Filter for valid prices
-    futures_data = futures_data[
-        futures_data['settle_price'] > 0]
+    futures_data = futures_data[futures_data['settle_price'] > 0]
 
     # Join with id
     futures_contracts = db.get_data(table_name='futures_contracts')
@@ -1928,6 +2051,7 @@ def ingest_historical_futures_prices(dataset=None,
                    right=futures_data,
                    on='ticker')
 
+    # Filter down columns
     for col in tmp.columns:
         if col not in futures_prices_table.columns.keys():
             del tmp[col]
@@ -1936,6 +2060,13 @@ def ingest_historical_futures_prices(dataset=None,
                                 table=futures_prices_table,
                                 extra_careful=False,
                                 time_series=True)
+
+    # Days to maturity
+    precompute_historical_futures_days_to_maturity(
+        futures_series=futures_series,
+        start_date=start_date,
+        generic=True
+    )
 
     return result
 
@@ -1968,32 +2099,94 @@ def update_futures_prices(start_date=None,
     if date is None:
         date = dt.datetime.today() - BDay()
 
-    # VIX futures
-    futures_series = 'VX'
-    source_series = 'VX'
-    dataset = 'CBOE'
-    contract_range = np.arange(1, 10)
-    update_vix_futures_settle_prices()
-    update_futures_prices_by_series(dataset=dataset,
-                                    futures_series=futures_series,
-                                    source_series=source_series,
-                                    contract_range=contract_range,
-                                    date=date)
-    precompute_seasonality_adjusted_vol_futures_prices(
-        futures_series=futures_series, start_date=date)
+    fm = QuandlApi.get_futures_metadata()
 
-    # V2X futures
-    futures_series = 'FVS'
-    source_series = 'FVS'
-    dataset = 'EUREX'
-    contract_range = np.arange(1, 8)
-    update_futures_prices_by_series(dataset=dataset,
-                                    futures_series=futures_series,
-                                    source_series=source_series,
-                                    contract_range=contract_range,
-                                    date=date)
-    precompute_seasonality_adjusted_vol_futures_prices(
-        futures_series=futures_series, start_date=date)
+    # Do this first
+    update_vix_futures_settle_prices()
+
+    for i in range(0, len(fm)):
+
+        futures_series = fm.loc[i, 'futures_series']
+        source_series = fm.loc[i, 'contracts_series']
+        dataset = fm.loc[i, 'contracts_dataset']
+        max_contract = fm.loc[i, 'num_generic_contracts']
+        contract_range = np.arange(1, int(max_contract) + 1)
+
+        update_futures_prices_by_series(
+            futures_series=futures_series,
+            exchange_code=dataset,
+            date=date,
+            source_series=source_series,
+            dataset=dataset,
+            contract_range=contract_range)
+
+
+def update_generic_futures_prices_by_series(futures_series=None,
+                                            exchange_code=None,
+                                            start_date=None,
+                                            data_source_name='quandl',
+                                            constant_maturities_in_days=None,
+                                            contract_range=np.arange(1, 10)):
+
+    # Defaults
+    if constant_maturities_in_days is None:
+        constant_maturities_in_days = [0, 5, 10, 21, 42, 63, 21 * 4, 21 * 5,
+                                       21 * 6, 21 * 7, 21 * 8]
+    if start_date is None:
+        start_date = utils.DateUtils.workday(date=dt.datetime.today(),
+                                             num_days=-1)
+
+    price_field = 'settle_price'
+
+    # Quandl metadata
+    fm = QuandlApi.get_futures_metadata()
+    fm.index = fm['futures_series']
+    source_series = fm.loc[futures_series, 'generic_series']
+    dataset = fm.loc[futures_series, 'generic_dataset']
+
+    # Spot prices for specific series
+    spot_prices = None
+    if futures_series == 'VX':
+        spot_prices = md.get_generic_index_prices("VIX", start_date)\
+            ['last_price'].reset_index(level='ticker', drop=True)
+    elif futures_series == 'FVS':
+        spot_prices = md.get_generic_index_prices('V2X', start_date)\
+            ['last_price'].reset_index(level='ticker', drop=True)
+
+    # Prices
+    ingest_historical_generic_futures_prices(
+        futures_series=futures_series,
+        exchange_code=exchange_code,
+        source_series=source_series,
+        contract_range=contract_range,
+        dataset=dataset,
+        start_date=start_date)
+
+    # Days to maturity
+    precompute_historical_futures_days_to_maturity(
+        futures_series=futures_series,
+        start_date=start_date,
+        generic=True
+    )
+
+    # Right now seasonality adjustments only for volatility futures
+    volatilities = False
+    if futures_series in ('VX', 'FVS'):
+        price_field = 'seasonality_adj_price'
+        volatilities = True
+        precompute_seasonality_adjusted_vol_futures_prices(
+            futures_series=futures_series, start_date=start_date
+        )
+
+    # Constant-maturity
+    precompute_constant_maturity_futures_prices(
+        futures_series=futures_series,
+        start_date=start_date,
+        constant_maturities_in_days=constant_maturities_in_days,
+        price_field=price_field,
+        spot_prices=spot_prices,
+        volatilities=volatilities
+    )
 
 
 def update_generic_futures_prices(start_date=None,
@@ -2004,67 +2197,29 @@ def update_generic_futures_prices(start_date=None,
     if date is None:
         date = dt.datetime.today() - BDay()
 
-    # VIX futures
-    futures_series = 'VX'
-    source_series = 'CBOE_VX'
-    dataset = 'CHRIS'
-    contract_range = np.arange(1, 10)
-    constant_maturities_in_days = [0, 5, 10, 21, 42, 63, 21 * 4, 21 * 5, 21 * 6,
-                                   21 * 7, 21 * 8]
+    fm = QuandlApi.get_futures_metadata()
 
-    vix_spot_price = YahooApi.retrieve_prices("^VIX", date, date)['adj_close']
-    ingest_historical_generic_futures_prices(
-        futures_series=futures_series,
-        source_series=source_series,
-        contract_range=contract_range,
-        dataset=dataset,
-        start_date=date)
+    for i in range(0, len(fm)):
 
-    precompute_historical_futures_days_to_maturity(
-        futures_series=futures_series,
-        start_date=date,
-        generic=True
-    )
+        futures_series = fm.loc[i, 'futures_series']
+        dataset = fm.loc[i, 'generic_dataset']
+        exchange = fm.loc[i, 'contracts_dataset']
+        max_contract = int(fm.loc[i, 'num_generic_contracts'])
+        constant_maturities_in_days = [0, 5, 10]
+        for j in range(1, max_contract + 1):
+            constant_maturities_in_days.append(
+                constants.trading_days_per_month * j)
 
-    precompute_constant_maturity_futures_prices(
-        futures_series=futures_series,
-        start_date=date,
-        constant_maturities_in_days=constant_maturities_in_days,
-        price_field='seasonality_adj_price',
-        spot_prices=vix_spot_price
-    )
-
-    # V2X futures
-    futures_series = 'FVS'
-    source_series = 'EUREX_FVS'
-    dataset = 'CHRIS'
-    contract_range = np.arange(1, 8)
-    constant_maturities_in_days = [0, 5, 10, 21, 42, 63, 21 * 4, 21 * 5, 21 * 6]
-
-    ingest_historical_generic_futures_prices(
-        futures_series=futures_series,
-        source_series=source_series,
-        contract_range=contract_range,
-        dataset=dataset,
-        start_date=date)
-
-    precompute_historical_futures_days_to_maturity(
-        futures_series=futures_series,
-        start_date=date,
-        generic=True
-    )
-
-    precompute_constant_maturity_futures_prices(
-        futures_series=futures_series,
-        start_date=date,
-        constant_maturities_in_days=constant_maturities_in_days,
-        price_field='seasonality_adj_price',
-        spot_prices=None
-    )
+        update_generic_futures_prices_by_series(
+            futures_series=futures_series,
+            exchange_code=exchange,
+            start_date=date,
+            constant_maturities_in_days=constant_maturities_in_days)
 
 
 def update_futures_prices_by_series(dataset=None,
                                     futures_series=None,
+                                    exchange_code=None,
                                     source_series=None,
                                     contract_range=np.arange(1, 10),
                                     date=None):
@@ -2074,19 +2229,19 @@ def update_futures_prices_by_series(dataset=None,
 
     # Get updated futures data
     futures_data = qfl_data.QuandlApi.update_daily_futures_prices(
-        date=date,
+        start_date=date,
         dataset=dataset,
         futures_series=source_series,
         contract_range=contract_range
     )
 
     # Map to appropriate contact
-    series_data = db.get_futures_series(futures_series=futures_series)
+    series_data = db.get_futures_series(futures_series=futures_series,
+                                        exchange_code=exchange_code)
     series_id = series_data['id'].values[0]
 
     where_str = " series_id = " + str(series_id) \
-                + " and maturity_date >= '" \
-                + dt.datetime.today().date().__str__() + "'"
+                + " and maturity_date >= '{0}'".format(dt.datetime.today())
 
     futures_contracts_data = db.get_data(
         table_name='futures_contracts',
@@ -2105,13 +2260,17 @@ def update_futures_prices_by_series(dataset=None,
     df = df[cols]
 
     futures_prices_table = db.get_table('futures_prices')
-    db.execute_db_save(df=df,
-                       table=futures_prices_table,
-                       extra_careful=False)
 
-    precompute_historical_futures_days_to_maturity(
-        futures_series=futures_series,
-        start_date=date
-    )
+    if len(df) > 0:
+        db.execute_db_save(df=df,
+                           table=futures_prices_table,
+                           extra_careful=False)
+
+        precompute_historical_futures_days_to_maturity(
+            futures_series=futures_series,
+            start_date=date
+        )
+    else:
+        x=1
 
     # TODO: what to do if we find a contract that we don't have in the DB
