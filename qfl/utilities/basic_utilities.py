@@ -201,11 +201,20 @@ class DateUtils(object):
                     end_date=None,
                     calendar_name=default_calendar):
 
+        if isinstance(start_date, pd.Series) and isinstance(end_date, pd.Series):
+            hol = cls.get_holidays(calendar_name).keys()
+            A = [d.date() for d in start_date]
+            B = [d.date() for d in end_date]
+            return np.busday_count(A, B, holidays=hol)
+
         if is_iterable(start_date):
             if len(start_date) == 0:
                 raise ValueError("start date cannot be zero-length!")
 
+        is_series = False
         if isinstance(start_date, pd.Series):
+            is_series = True
+            orig_index = start_date.index
             start_date = start_date.values
 
         if isinstance(end_date, pd.Series):
@@ -235,7 +244,10 @@ class DateUtils(object):
             df.loc[i, 'net_workdays'] = len(dates[df.loc[i, 'start_date']
                                                  :df.loc[i, 'end_date']])-1
 
-        if len(df) == 1:
+        if is_series:
+            return pd.Series(index=orig_index,
+                             data=df['net_workdays'].values)
+        elif len(df) == 1:
             return df['net_workdays'].values[0].tolist()
         else:
             return df['net_workdays'].values.tolist()
@@ -246,13 +258,13 @@ def get_days_from_maturity(start_date=None,
                            date=None,
                            calendar_name='UnitedStates'):
 
-        days_to_maturity = networkdays(start_date=start_date,
-                                       end_date=maturity_date,
-                                       calendar_name=calendar_name)
+        total_days = networkdays(start_date=start_date,
+                                 end_date=maturity_date,
+                                 calendar_name=calendar_name)
         days_elapsed = networkdays(start_date=start_date,
                                    end_date=date,
                                    calendar_name=calendar_name)
-        total_days = days_to_maturity + days_elapsed
+        days_to_maturity = total_days - days_elapsed
 
         # Handle forward start
         if is_iterable(days_elapsed):
@@ -261,7 +273,7 @@ def get_days_from_maturity(start_date=None,
             if days_elapsed < 0:
                 days_elapsed = 0
 
-        return days_to_maturity, days_elapsed
+        return days_to_maturity, days_elapsed, total_days
 
 
 def networkdays(start_date=None,
@@ -269,6 +281,13 @@ def networkdays(start_date=None,
                 calendar_name=DateUtils.default_calendar):
 
     return DateUtils.networkdays(start_date, end_date, calendar_name)
+
+
+def calendarday(date=None, num_days=1):
+    if isinstance(num_days, pd.DataFrame) or isinstance(num_days, pd.Series):
+        return date + pd.TimedeltaIndex(num_days.values, unit='D')
+    else:
+        return date + dt.timedelta(days=num_days)
 
 
 def workday(date=None,

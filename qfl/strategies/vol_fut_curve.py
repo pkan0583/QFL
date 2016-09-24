@@ -128,7 +128,7 @@ class VixCurveStrategy(Strategy):
 
         # Vega-vs-delta (short vol, short stocks)
         cls.calc.backtest_data \
-            = pd.DataFrame(index=cls.data.curve_returns.index)
+            = pd.DataFrame(index=cls.data.vol_fut_returns.index)
 
         cls.calc.backtest_data['front'] = cls.data.vol_fut_returns[st]
         cls.calc.backtest_data['back'] = cls.data.vol_fut_returns[lt] \

@@ -88,6 +88,7 @@ class Strategy(object):
         signal_se_beta_to_vol = kwargs.get('signal_se_beta_to_vol', 0.75)
         signal_er_corr_shrinkage = kwargs.get('signal_er_corr_shrinkage', 0.80)
         sum_of_weights = kwargs.get('sum_of_weights', 1.0)
+        er_shrinkage = kwargs.get('er_shrinkage', 0.25)
 
         # Prepare model
         signal_corr_adj, signal_cov_adj, signal_er_cov = \
@@ -98,7 +99,8 @@ class Strategy(object):
                 corr_r_shrinkage=signal_corr_shrinkage,
                 corr_er_shrinkage=signal_er_corr_shrinkage,
                 er_se_beta_to_er=signal_se_beta_to_er,
-                er_se_beta_to_vol=signal_se_beta_to_vol
+                er_se_beta_to_vol=signal_se_beta_to_vol,
+                er_shrinkage=er_shrinkage
             )
 
         # Signal portfolio optimization
@@ -227,6 +229,83 @@ class PortfolioStrategy(Strategy):
         x=1
 
 
+    @classmethod
+    def compute_signal_quantile_performance(cls, **kwargs):
+        """
+        This is a highly idealized notion of signal performance involving
+        mid-market daily trading... arguably very subject to data noise
+        though actually surprisingly comparable to the proper version
+        :param kwargs:
+        :return:
+        """
+
+        # Methods: 'top_bottom_n', 'top_bottom_pct'
+        method = kwargs.get('method', 'top_bottom_q')
+        signal_data = kwargs.get('signal_data', None)
+
+        quantiles = kwargs.get('quantiles', [0.0, 0.20, 0.40, 0.60, 0.80, 1.0])
+        if quantiles[0] > 0:
+            quantiles = [0] + quantiles
+
+        # This should be the core data which has "tot_pnl" as a field
+        data = kwargs.get('data', None)
+
+        signal_pctile = pd.DataFrame(index=signal_data.index,
+                                     columns=signal_data.columns)
+
+        signal_pctile = signal_pctile.unstack('ticker')
+
+        for sig in signal_data.columns:
+            signal_data_sig = signal_data[sig].unstack('ticker')
+
+            # Cross-sectional percentile
+            signal_pctile[sig] = signal_data_sig.rank(axis=1, pct=True)
+
+        signal_positions = dict()
+        signal_pnl = dict()
+        data = data.unstack('ticker')
+
+        for i in range(1, len(quantiles)):
+
+            q = quantiles[i]
+            q_ = quantiles[i - 1]
+
+            signal_positions[q] = pd.DataFrame(index=signal_data.index,
+                                               columns=signal_data.columns) \
+                                                .unstack('ticker')
+
+            signal_pnl[q] = pd.DataFrame(index=signal_data.index,
+                                         columns=signal_data.columns) \
+                                                .unstack('ticker')
+
+            for sig in signal_data.columns:
+                # Signal positions as quantiles
+                signal_positions[q][sig][(signal_pctile[sig].shift(1) > q)] = 0
+                signal_positions[q][sig][(signal_pctile[sig].shift(1) < q_)] = 0
+                signal_positions[q][sig][(signal_pctile[sig].shift(1) <= q)
+                                         & (signal_pctile[sig].shift(1) > q_)] = 1
+
+                signal_pnl[q][sig] = signal_positions[q][sig] * data['tot_pnl']
+                signal_pnl[q][sig] = signal_pnl[q][sig].fillna(value=0)
+
+            # Replace NONE with NAN
+            signal_positions[q] = signal_positions[q].where(
+                (pd.notnull(signal_positions[q])), 0)
+
+        return signal_pnl, signal_positions, signal_pctile
+
+
+class SignalAnalyzer(object):
+
+    @staticmethod
+    def compute_time_varying_expected_return():
+
+        # A Bayesian algo would do something along the lines of a rolling
+        # return with capping of outliers based on previous rolling return
+
+        x=1
+
+
 class PortfolioOptimizer(object):
 
     @staticmethod
@@ -236,7 +315,11 @@ class PortfolioOptimizer(object):
                                   corr_r_shrinkage=0.90,
                                   corr_er_shrinkage=0.70,
                                   er_se_beta_to_er=0.25,
-                                  er_se_beta_to_vol=0.75):
+                                  er_se_beta_to_vol=0.75,
+                                  er_shrinkage=0.25):
+
+        # Expected return shrink towards zero
+        er = (1 - er_shrinkage) * er
 
         # Signal correlation and covariance shrinkage
         for row in cov_r.columns:
@@ -413,3 +496,41 @@ class PortfolioOptimizer(object):
                 sim_perf[sim_perf.columns[np.floor(num_sims * pctile)]]
 
         return sim_perf_percentiles, sim_perf
+
+    @staticmethod
+    def compute_rv_signal_portfolio_sensitivity(signals_pnl=None,
+                                                weights=None,
+                                                num_sims=1000,
+                                                sigma=2.0):
+        perf_pctiles = [0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99]
+
+        randoms = np.random.randn(num_sims, len(weights)) * sigma / len(weights)
+        randoms = pd.DataFrame(data=randoms, columns=signals_pnl.columns)
+
+        sim_perf = pd.DataFrame(index=signals_pnl.index,
+                                columns=range(0, num_sims))
+
+        for s in range(0, num_sims):
+
+            if np.mod(s, 100) == 0:
+                print('simulation ' + str(s) + " out of " + str(num_sims))
+
+            sim_weights = weights['weight'] + randoms.iloc[s]
+            sim_weights[sim_weights < 0.0] = 0.0
+            sim_weights /= sim_weights.sum()
+
+            sim_perf[s] = 0
+            for sig in signals_pnl.columns:
+                sim_perf[s] += signals_pnl[sig] * sim_weights[sig]
+
+        sim_perf_total = sim_perf.sum(axis=0).sort_values()
+        sim_perf = sim_perf[sim_perf_total.index]
+
+        sim_perf_percentiles = pd.DataFrame(index=signals_pnl.index,
+                                            columns=perf_pctiles)
+        for pctile in perf_pctiles:
+            sim_perf_percentiles[pctile] = \
+                sim_perf[sim_perf.columns[np.floor(num_sims * pctile)]]
+
+        return sim_perf_percentiles, sim_perf
+

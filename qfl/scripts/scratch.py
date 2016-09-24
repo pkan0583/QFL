@@ -1,5 +1,5 @@
-import datetime as dt
 
+import datetime as dt
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import numpy as np
@@ -7,7 +7,10 @@ import pandas as pd
 import pandas_datareader.data as pdata
 import pyfolio
 import pymc
+import struct
 from matplotlib import cm
+from sklearn.decomposition import FactorAnalysis, PCA
+from gensim import corpora, models, similarities
 
 import qfl.core.calcs as calcs
 import qfl.core.calcs as lib
@@ -20,324 +23,241 @@ import qfl.macro.macro_models as macro
 import qfl.utilities.basic_utilities as utils
 import qfl.core.portfolio_utils as putils
 
-reload(calcs)
-reload(utils)
-reload(qfl_data)
-reload(data_int)
-reload(md)
-reload(etl)
-
 from qfl.etl.data_interfaces import QuandlApi, IBApi, DataScraper, NutmegAdapter, YahooApi
 from qfl.core.database_interface import DatabaseInterface as db
 from qfl.utilities.chart_utilities import format_plot
 from qfl.utilities.nlp import DocumentsAnalyzer as da
-
-from gensim import corpora, models, similarities
-
+from qfl.core.market_data import VolatilitySurfaceManager
+from qfl.macro.macro_models import FundamentalMacroModel
+import qfl.utilities.statistics as stats
+import qfl.models.volatility_factor_model as vfm
+from qfl.utilities.statistics import RollingFactorModel
+from qfl.models.volatility_factor_model import VolatilityFactorModel
 
 db.initialize()
 
-reload(md)
-from qfl.core.market_data import VolatilitySurfaceManager
+
+'''
+--------------------------------------------------------------------------------
+Illustrating portfolio construction
+--------------------------------------------------------------------------------
+'''
+
+# Illustrating signals
+
+er_shrinkage = 0.25
+
+grid = np.arange(-0.10, 0.20, 0.01)
+
+mu_er = np.array([0.05, 0.02])
+sd_r = np.array([0.04, 0.04])
+corr_r = np.array([[1.0, 0.9], [0.9, 1.0]])
+sd_er = np.array([0.02, 0.015])
+corr_er = np.array([[1.0, 0.50], [0.50, 1.0]])
+zero_sd_er = np.array([0.0, 0.0])
+
+# Apply shrinkage (should this be e.g. within-category? eh
+mu_er_adj = (1 - er_shrinkage) * mu_er
+
+cov_r = np.array([[1.0 * sd_r[0] * sd_r[0],  0.90 * sd_r[0] * sd_r[1]],
+                  [0.90 * sd_r[0] * sd_r[1], 1.0  * sd_r[1] * sd_r[1]]])
+cov_er = np.array([[1.0 * sd_er[0] * sd_er[0], 0.50 * sd_r[0] * sd_r[1]],
+                  [0.05 * sd_r[0] * sd_r[1], 1.0  * sd_r[1] * sd_r[1]]])
+cov_er_z = np.array([[0, 0], [0, 0]])
+
+from qfl.strategies.strategies import PortfolioOptimizer
+w = PortfolioOptimizer.compute_portfolio_weights(
+    er=mu_er,
+    cov_r=cov_r,
+    cov_er=cov_er,
+    time_horizon_days=252 * 3,
+    long_only=False
+)
+
+from scipy.stats import norm
+
+
+s1_dist = norm.pdf((grid - mu_er[0]) / sd_r[0])
+s2_dist = norm.pdf((grid - mu_er[1]) / sd_r[1])
+
+s1_dist_adj = norm.pdf((grid - mu_er_adj[0]) / (0 * sd_r[0] ** 2 + sd_er[0] ** 2) ** 0.5)
+s2_dist_adj = norm.pdf((grid - mu_er_adj[1]) / (0 * sd_r[1] ** 2 + sd_er[1] ** 2) ** 0.5)
+
+# Just volatility
+fig, axarr = plt.subplots(2, sharex=True)
+plt.plot(grid, s1_dist, c='b')
+axarr[0].plot(grid, s1_dist_adj, c='b', linestyle='--')
+axarr[0].legend(['historical return distribution',
+                 'distribution of future mean return'], loc=2)
+axarr[0].set_title('signal 1')
+axarr[0].set_xlabel('return, %')
+
+# With volatility and uncertainty
+
+fig, axarr = plt.subplots(2, sharex=True)
+axarr[0].plot(grid, s1_dist, c='b')
+axarr[0].plot(grid, s1_dist_adj, c='b', linestyle='--')
+axarr[0].legend(['historical return distribution',
+                 'distribution of future mean return'], loc=2)
+axarr[0].set_title('signal 1')
+axarr[0].set_xlabel('return, %')
+axarr[1].plot(grid, s2_dist, c='r')
+axarr[1].plot(grid, s2_dist_adj, c='r', linestyle='--')
+axarr[1].legend(['historical return distribution',
+                 'distribution of future mean return'])
+axarr[1].set_title('signal 2')
+axarr[1].set_xlabel('return, %')
+
+
+'''
+--------------------------------------------------------------------------------
+Volatility PCA rolling
+--------------------------------------------------------------------------------
+'''
+
+# OK. Factor model for the ETF implied volatilities
+# Key thing is we need to figure out how to make this out of sample
+
+import struct
+from sklearn.decomposition import FactorAnalysis, PCA
+import qfl.utilities.statistics as stats
+reload(stats)
+import qfl.models.volatility_factor_model as vfm
+reload(vfm)
+from qfl.utilities.statistics import RollingFactorModel
+from qfl.models.volatility_factor_model import VolatilityFactorModel
+
+# Rolling window for PCA
+minimum_obs = 21
+window_length_days = 512
+update_interval_days = 21
+iv_com = 63
+n_components = 3
+factor_model_start_date = dt.datetime(2010, 1, 1)
+
+# Getting some data
+tickers = md.get_etf_vol_universe()
 
 vsm = VolatilitySurfaceManager()
-vsm.load_data(tickers=['EWZ'])
-tmp = vsm.get_surface_point(tickers=['EWZ'], call_delta=0.75, tenor_in_days=30)
+vsm.load_data(tickers=tickers, start_date=factor_model_start_date)
+VolatilityFactorModel.initialize_data(vsm=vsm,
+                                      tickers=tickers,
+                                      iv_com=iv_com)
 
-# What if I need
+factor_weights_composite, factor_data_composite, factor_data_oos = \
+    VolatilityFactorModel.run(minimum_obs=minimum_obs,
+                              window_length_days=window_length_days,
+                              update_interval_days=update_interval_days,
+                              n_components=n_components)
+
+
+# Normalize first factor to the sign of SPY
+spy_weights_0 = factor_weights_composite[0].unstack('ticker')['SPY']
+for date in spy_weights_0.index:
+    if spy_weights_0.loc[date] < 0:
+        ind = factor_weights_composite.index[
+            factor_weights_composite.index.get_level_values('date') == date]
+        factor_weights_composite.loc[ind, 0] *= -1.0
+
+
+# Well keep in mind... rolling PCA means the factors themselves are changing
+# So the time series of factor 2 may not mean much
+plt.plot(factor_weights_composite[0].unstack('ticker')[['SPY', 'TLT', 'EEM']])
+
+# In-sample versus out-of-sample weights
+plt.figure()
+plt.plot(factor_data_composite[0].iloc[100:250], color='b')
+plt.plot(factor_data_oos[0].iloc[100:250], color='r')
+
+# Now a single fully in-sample PCA for plots
+iv_3m_chg_z_ = iv_chg_z.copy(deep=True)
+del iv_3m_chg_z_['EMB']
+del iv_3m_chg_z_['HEDJ']
+del iv_3m_chg_z_['SQQQ']
+del iv_3m_chg_z_['TQQQ']
+iv_3m_chg_z_ = iv_3m_chg_z_[np.isfinite(iv_3m_chg_z_).all(axis=1)]
+fa = FactorAnalysis(n_components=n_components).fit(iv_3m_chg_z_)
+factor_data_insample = pd.DataFrame(index=iv_3m_chg_z_.index,
+                                    data=fa.transform(iv_3m_chg_z_))
+factor_weights_insample = pd.DataFrame(index=iv_3m_chg_z_.columns,
+                                       data=fa.components_.transpose())
+if factor_weights_insample.loc['SPY', 0] < 0:
+    factor_weights_insample[0] *= -1.0
+    factor_data_insample[0] *= -1.0
+
+# F1 is volatility
+# F2 is macro (FI, gold, ccy) vs energy/EM
+# F3 is macro (including energy) vs high quality equity?
+# F4 is
+
+# Obviously this changes
+factor_names = ['overall volatility',
+                'energy',
+                'macro',
+                'tech/biotech']
+
+
+# Scatterplot of current factor loadings of ETFs
+
+fw_dates = factor_weights_composite.index.get_level_values('date')
+fw_current = factor_weights_composite[fw_dates == fw_dates.max()]
+fw_current = fw_current.reset_index().set_index(['ticker'])
+del fw_current['date']
+
+size_mean = 80
+size_z = (fw_current[0] - fw_current[0].mean()) / fw_current[0].std()
+
+fig, ax = plt.subplots()
+x = fw_current[1]
+y = fw_current[2]
+size_data = size_mean * np.exp(1.0 * size_z)
+color_data = -fw_current[3]
+
+# GDX is being silly
+x.loc['GDX'] = fw_current[2].loc['GDX']
+y.loc['GDX'] = fw_current[1].loc['GDX']
+
+lab = fw_current.index.get_level_values('ticker')
+ax.scatter(x, y, s=size_data, c=color_data, cmap=plt.cm.plasma)
+
+for i, txt in enumerate(lab):
+    ax.annotate(txt, (x.values[i], y.values[i]), fontsize=10)
+
+plt.ylabel('fixed income volatility factor')
+plt.xlabel('commodity volatility factor')
+
+
+# Time series plot of the factors
+plt.plot(factor_data_composite.iloc[63:])
+plt.legend(factor_names)
+
+# Time series plot of the volatility of the factors themselves
+plt.plot(factor_data_composite.iloc[63:].ewm(com=63).std())
+plt.legend(factor_names)
 
 
 '''
 --------------------------------------------------------------------------------
-Volatility relative value
+Volatility data cleaning
 --------------------------------------------------------------------------------
 '''
 
-# OK. Pure version: static strategy  would have PNL equal to
-# gamma PNL plus term structure rolldown, e.g. it's as-if you owned
-# an option that day
+# testing data cleaning
+start_date = dt.datetime(2010, 1, 1)
+vsm = VolatilitySurfaceManager()
+vsm.load_data(tickers=['SPY', 'EEM'], start_date=start_date)
+iv = vsm.get_data(tickers=['SPY', 'EEM'],
+                  start_date=start_date,
+                  fields=['iv_3m'])['iv_3m'].unstack('ticker')
+sp = md.get_equity_prices(tickers=['EEM'],
+                          start_date=start_date,
+                          price_field='adj_close')['adj_close'].unstack('ticker')
 
-# Key thing here is that we have a PNL stream for every underlying
-# So there's no "static strategy"
-# I think I need 'portfolio RV strategy' or something
+tmp = calcs.clean_implied_vol_data(tickers=['SPY', 'EEM'],
+                                   ivol=iv,
+                                   stock_prices=sp,
+                                   ref_ivol_ticker='SPY')
 
-import qfl.strategies.volswap_rv as volswap_rv
-reload(volswap_rv)
-from qfl.strategies.volswap_rv import VolswapRvStrategy as vrv
-
-vrv.initialize_data()
-vrv.process_data()
-
-rv_iv_signals = vrv.initialize_rv_iv_signals()
-iv_signals = vrv.initialize_iv_signals()
-ts_signals = vrv.initialize_ts_signals()
-
-rv_iv_pnl, rv_iv_pos, rv_iv_pctile \
-    = vrv.compute_signal_quantile_performance(signal_data=rv_iv_signals)
-
-iv_pnl, iv_pos, iv_pctile \
-    = vrv.compute_signal_quantile_performance(signal_data=iv_signals)
-
-ts_pnl, ts_pos, ts_pctile \
-    = vrv.compute_signal_quantile_performance(signal_data=ts_signals)
-
-# signal_pnl, signal_pos, signal_pctile = vrv.compute_master_backtest()
-print('done!')
-
-# Save
-vrv_data = vrv.data
-vrv_settings = vrv.settings
-vrv_calc = vrv.calc
-
-# Restore
-vrv.data = vrv_data
-vrv.settings = vrv_settings
-vrv.calc = vrv_calc
-
-signal_pnl = rv_iv_pnl
-signal_positions = rv_iv_pos
-quantiles = signal_pnl.keys()
-signal_com = np.unique(signal_pnl[1.0].columns.get_level_values(None))
-
-buy_q = 0.80
-sell_q = 0.20
-tc_vega = 0.1
-
-# Comparing COM for a long/short pair of quantiles
-plt.figure()
-for com in signal_com:
-    l = signal_pnl[buy_q][com].sum(axis=1).cumsum()
-    s = signal_pnl[sell_q][com].sum(axis=1).cumsum()
-    tc = (signal_positions[buy_q][com].abs().sum(axis=1).cumsum()
-       + signal_positions[sell_q][com].abs().sum(axis=1).cumsum()) * tc_vega
-    plt.plot(l-s-tc)
-plt.legend(signal_com, loc=2)
-
-# Comparing quantiles for each COM
-for com in signal_com:
-    plt.figure()
-    for i in range(1, len(quantiles)):
-        plt.plot(signal_pnl[quantiles[i]][com].sum(axis=1).cumsum())
-    plt.legend(quantiles[1:], loc=2)
-    plt.title("com = " + str(com))
-
-'''
---------------------------------------------------------------------------------
-VIX curve
---------------------------------------------------------------------------------
-'''
-
-import qfl.strategies.strategies as strat
-import qfl.strategies.vol_fut_curve as vft
-reload(vft)
-reload(strat)
-from qfl.strategies.vol_fut_curve import VixCurveStrategy as vc
-
-# Beginning of semi-clean VIX futures data
-start_date = dt.datetime(2007, 3, 26)
-holding_period_days = 1
-signals_z_cap = 1.0
-vol_target_com = 63
-rolling_beta_com = 63
-
-# Prep
-vc.initialize_data(vol_futures_series='VX',
-                   short_month=1,
-                   long_month=5)
-
-vc.compute_hedge_ratios(rolling_beta_com=rolling_beta_com)
-
-# Main analysis
-vc_output = vc.compute_master_backtest(
-    holding_period_days=holding_period_days,
-    signals_z_cap=signals_z_cap,
-    vol_target_com=vol_target_com)
-
-# Risk and return
-vc_output.combined_pnl.std()
-vc_output.combined_pnl['optim_weight'].rolling(21).sum().quantile(0.005)
-vc_output.combined_pnl_net.rolling(21).sum().mean()
-
-# Sensitivity analysis to weights
-num_sims = 1000
-sigma = 2.0
-sens_percentile = 0.01
-sim_perf_percentiles, sim_perf = \
-    strat.PortfolioOptimizer.compute_signal_portfolio_sensitivity(
-        strategy=vc,
-        signals_data=vc_output.signal_output.signals_data,
-        weights=vc_output.weights,
-        num_sims=num_sims,
-        sigma=sigma,
-        signals_z_cap=signals_z_cap,
-        holding_period_days=holding_period_days,
-        vol_target_com=vol_target_com
-    )
-
-# Basic plot
-plt.figure()
-plt.plot(vc_output.combined_pnl_net['optim_weight'].cumsum())
-plt.ylabel('cumulative strategy PNL, in vegas of max position size')
-# plt.legend(['smart weighting', 'all signals equal weight'], loc=2)
-
-# Momentum plot
-plt.figure()
-mom_signals = ['mom_5', 'mom_10', 'mom_21', 'mom_63']
-plt.plot(vc_output.signal_output.signal_pnl[mom_signals].cumsum())
-colormap = plt.get_cmap('coolwarm')
-plt.gca().set_color_cycle([colormap(i)
-                           for i in np.linspace(0, 0.9, len(mom_signals))])
-plt.legend(mom_signals, loc=2)
-plt.ylabel('cumulative strategy PNL, in vegas of max position size')
-
-# Convexity plot
-plt.figure()
-cv_signals = ['cv_0', 'cv_1', 'cv_5', 'cv_10']
-colormap = plt.get_cmap('spectral')
-plt.gca().set_color_cycle([colormap(i)
-                           for i in np.linspace(0, 0.9, len(cv_signals))])
-plt.plot(vc_output.signal_output.signal_pnl[cv_signals].cumsum())
-plt.legend(cv_signals, loc=2)
-plt.ylabel('cumulative strategy PNL, in vegas of max position size')
-
-# TS plot
-plt.figure()
-ts_signals = ['ts_0', 'ts_1', 'ts_5', 'ts_10']
-colormap = plt.get_cmap('gist_heat')
-plt.gca().set_color_cycle([colormap(i)
-                           for i in np.linspace(0, 0.9, len(ts_signals))])
-plt.plot(vc_output.signal_output.signal_pnl[ts_signals].cumsum())
-plt.legend(ts_signals, loc=2)
-plt.ylabel('cumulative strategy PNL, in vegas of max position size')
-
-# Signal robustness plot
-plt.figure()
-plt.plot(vc_output.combined_pnl_net.cumsum())
-plt.plot(sim_perf_percentiles.cumsum())
-cols = ['optim_weight', 'equal_weight'] + [str(c) for c in sim_perf_percentiles.columns]
-plt.legend(cols, loc=2)
-
-'''
---------------------------------------------------------------------------------
-Vega vs delta
---------------------------------------------------------------------------------
-'''
-
-import qfl.strategies.strategies as strat
-import qfl.strategies.vega_vs_delta as vdm
-reload(vdm)
-from qfl.strategies.vega_vs_delta import VegaVsDeltaStrategy as vd
-from qfl.core.database_interface import DatabaseUtilities as dbutils
-from pandas.tseries.offsets import BDay
-
-# Beginning of semi-clean VIX futures data
-start_date = dt.datetime(2007, 3, 26)
-change_window_days_short = 5
-change_window_days_long = 252
-holding_period_days = 1
-signals_z_cap = 1.0
-vol_target_com = 63
-rolling_beta_com = 63
-tc = 0.05
-
-corr_r_shrinkage = 0.90
-corr_er_shrinkage = 0.70
-er_se_beta_to_er = 0.25
-er_se_beta_to_vol = 0.75
-
-vd.initialize_data()
-
-vd_output = vd.compute_master_backtest(
-    holding_period_days=holding_period_days,
-    vol_target_com=vol_target_com,
-    rolling_beta_com=rolling_beta_com,
-    signals_z_cap=signals_z_cap,
-    transaction_cost_per_unit=tc,
-    corr_r_shrinkage=corr_r_shrinkage,
-    corr_er_shrinkage=corr_er_shrinkage,
-    signal_se_beta_to_er=er_se_beta_to_er,
-    signal_se_beta_to_vol=er_se_beta_to_vol)
-
-# Sensitivity analysis to weights
-num_sims = 1000
-sigma = 2.0
-sens_percentile = 0.01
-
-sim_perf_percentiles, sim_perf = \
-    strat.PortfolioOptimizer.compute_signal_portfolio_sensitivity(
-        strategy=vd,
-        signals_data=vd_output.signal_output.signals_data,
-        weights=vd_output.weights,
-        num_sims=num_sims,
-        sigma=sigma,
-        signals_z_cap=signals_z_cap,
-        holding_period_days=holding_period_days,
-        vol_target_com=vol_target_com
-    )
-
-
-# Risk and return
-vd_output.combined_pnl.rolling(21).sum().std()
-vd_output.combined_pnl['optim_weight'].rolling(21).sum().iloc[21:].quantile(0.005)
-vd_output.combined_pnl_net.rolling(21).sum().mean()
-vd_output.combined_pnl_net.rolling(21).sum().mean() / vd_output.combined_pnl.rolling(21).sum().std() * np.sqrt(12)
-
-plt.figure()
-plt.plot(vd_output.combined_pnl_net['optim_weight'].cumsum(), color='k')
-plt.plot(sim_perf_percentiles.cumsum())
-plt.legend(['strategy', '1%', '10%', '25%', '50%', '75%', '90%', '99%'], loc=2)
-
-
-# Basic plot
-plt.figure()
-plt.plot(vd_output.combined_pnl_net['optim_weight'].cumsum())
-plt.ylabel('cumulative strategy PNL, in vegas of max position size')
-# plt.legend(['smart weighting', 'all signals equal weight'], loc=2)
-
-# Positioning plot
-plt.figure()
-pos_signals = ['vol_spec_pos', 'index_spec_pos',
-               'vol_spec_pos_chg_s', 'index_spec_pos_chg_s',
-               'vol_spec_pos_chg_l', 'index_spec_pos_chg_l']
-plt.plot(vd_output.signal_output.signal_pnl[pos_signals].cumsum())
-colormap = plt.get_cmap('coolwarm')
-plt.gca().set_color_cycle([colormap(i)
-                           for i in np.linspace(0, 0.9, len(pos_signals))])
-plt.legend(pos_signals, loc=2)
-plt.ylabel('cumulative strategy PNL, in vegas of max position size')
-
-# RV  plot
-plt.figure()
-rv_signals = ['rv_10', 'rv_21', 'rv_42', 'rv_63']
-colormap = plt.get_cmap('spectral')
-plt.gca().set_color_cycle([colormap(i)
-                           for i in np.linspace(0, 0.9, len(rv_signals))])
-plt.plot(vd_output.signal_output.signal_pnl[rv_signals].cumsum())
-plt.legend(rv_signals, loc=2)
-plt.ylabel('cumulative strategy PNL, in vegas of max position size')
-
-# TS plot
-plt.figure()
-ts_signals = ['ts_0', 'ts_1', 'ts_5', 'ts_10']
-colormap = plt.get_cmap('gist_heat')
-plt.gca().set_color_cycle([colormap(i)
-                           for i in np.linspace(0, 0.9, len(ts_signals))])
-plt.plot(vd_output.signal_output.signal_pnl[ts_signals].cumsum())
-plt.legend(ts_signals, loc=2)
-plt.ylabel('cumulative strategy PNL, in vegas of max position size')
-
-# Weights comparison plot
-plt.figure()
-plt.plot(vd_output.combined_pnl_net.cumsum())
-plt.ylabel('cumulative strategy PNL, in vegas of max position size')
-plt.legend(['smart weighting', 'all signals equal weight'], loc=2)
-
-# Signal robustness plot
-plt.figure()
-plt.plot(vd_output.combined_pnl_net.cumsum())
-plt.plot(sim_perf_percentiles.cumsum())
-cols = ['optim_weight', 'equal_weight'] + [str(c) for c in sim_perf_percentiles.columns]
-plt.legend(cols, loc=2)
 '''
 --------------------------------------------------------------------------------
 Evaluate predictiveness of past PNL for future PNL
@@ -386,22 +306,6 @@ for com in com_range:
 
         pnl_pred_result.loc[com, cap_z] = \
             pnl_pred_dataset['pnl'].corr(pnl_pred_dataset['pnl_ewm_lag'])
-
-
-'''
---------------------------------------------------------------------------------
-Sensitivity analysis based on weights
---------------------------------------------------------------------------------
-'''
-
-
-
-'''
---------------------------------------------------------------------------------
-Can we fit a reasonable model to vol and stocks and use that to bootstrap
---------------------------------------------------------------------------------
-'''
-
 
 
 '''
@@ -674,20 +578,6 @@ pprint(list(enumerate(sims)))
 sims = sorted(enumerate(sims), key=lambda item: -item[1])
 pprint(sims)
 
-'''
---------------------------------------------------------------------------------
-Rolling PCA?
---------------------------------------------------------------------------------
-'''
-
-etf_tickers, etf_exchange_codes = md.get_etf_universe()
-
-prices = md.get_equity_prices(tickers=etf_tickers,
-                              start_date=md.history_default_start_date)
-prices = prices['adj_close'].unstack('ticker')
-
-# Every month we run a PCA on the last year's overlapping weekly returns
-
 
 '''
 --------------------------------------------------------------------------------
@@ -901,15 +791,15 @@ f, f_res, out_grid, npd = macro.prepare_nonparametric_analysis(
 # Plotting
 ##############################################################################
 
-plot_start_date = dt.datetime(2007, 1, 1)
+plot_start_date = dt.datetime(2005, 1, 1)
 plot_ind = npd.index[npd.index >= plot_start_date]
-plot_data = npd.loc[plot_ind, ['ZF1M', 'ZLF1']]
+plot_data = npd.loc[plot_ind, ['ZF1M', 'ZDF1']]
 text_color_scheme = 'red'
 background_color = 'black'
 
 f1, ax1 = plt.subplots(figsize=[10, 6])
 plt.plot(plot_data)
-ax1.set_title('US Macro Model',
+ax1.set_title('US Macro Model: 30 major data series',
               fontsize=14,
               fontweight='bold')
 ax1.title.set_color(text_color_scheme)
@@ -921,9 +811,12 @@ ax1.set_ylabel('Z-Score')
 ax1.tick_params(axis='x', colors=text_color_scheme)
 ax1.tick_params(axis='y', colors=text_color_scheme)
 # ax1.yaxis.set_major_formatter(mtick.FormatStrFormatter('%.1f%%'))
-leg = ax1.legend(['Level', 'Moving Average'], loc=3)
+leg = ax1.legend(['Level Z', 'Rate of Change Z'],  loc=3)
 ax1.set_axis_bgcolor(background_color)
 leg.get_frame().set_facecolor('red')
+ltext = plt.gca().get_legend().get_texts()
+plt.setp(ltext[0], fontsize=12, color='w')
+plt.setp(ltext[1], fontsize=12, color='w')
 plt.savefig('figures/macro.png',
             facecolor='k',
             edgecolor='k',

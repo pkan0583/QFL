@@ -657,17 +657,17 @@ class QuandlApi(ExternalDataApi):
 
         sd = dt.datetime(1990, 1, 1)
 
-        df.loc[0] = ['SP', 'CME', 'CHRIS', 'SP', 'CME_SP', sd, 3]
-        df.loc[1] = ['ES', 'CME', 'CHRIS', 'ES', 'CME_ES', sd, 3]
+        df.loc[0] = ['SP', 'CME', 'CHRIS', 'SP', 'CME_SP', sd, 4]
+        df.loc[1] = ['ES', 'CME', 'CHRIS', 'ES', 'CME_ES', sd, 4]
         df.loc[2] = ['CL', 'CME', 'CHRIS', 'CL', 'CME_CL', sd, 12]
         df.loc[3] = ['B',  'ICE', 'CHRIS', 'B',  'ICE_B',  sd, 12]
         df.loc[4] = ['BB', 'CME', 'CHRIS', 'BB', 'CME_BB', sd, 12]
-        df.loc[5] = ['GC', 'CME', 'CHRIS', 'GC', 'CME_GC', sd, 3]
-        df.loc[6] = ['SI', 'CME', 'CHRIS', 'SI', 'CME_SI', sd, 3]
+        df.loc[5] = ['GC', 'CME', 'CHRIS', 'GC', 'CME_GC', sd, 4]
+        df.loc[6] = ['SI', 'CME', 'CHRIS', 'SI', 'CME_SI', sd, 4]
         df.loc[7] = ['NG', 'CME', 'CHRIS', 'NG', 'CME_NG', sd, 12]
-        df.loc[8] = ['ED', 'CME', 'CHRIS', 'ED', 'CME_ED', sd, 3]
-        df.loc[9] = ['EC', 'CME', 'CHRIS', 'EC', 'CME_EC', sd, 3]
-        df.loc[10] = ['JY', 'CME', 'CHRIS', 'JY', 'CME_JY', sd, 3]
+        df.loc[8] = ['ED', 'CME', 'CHRIS', 'ED', 'CME_ED', sd, 4]
+        df.loc[9] = ['EC', 'CME', 'CHRIS', 'EC', 'CME_EC', sd, 4]
+        df.loc[10] = ['JY', 'CME', 'CHRIS', 'JY', 'CME_JY', sd, 4]
         df.loc[11] = ['VX', 'CBOE', 'CHRIS', 'VX', 'CBOE_VX', sd, 8]
         df.loc[12] = ['FVS', 'EUREX', 'CHRIS', 'FVS', 'EUREX_FVS', sd, 6]
 

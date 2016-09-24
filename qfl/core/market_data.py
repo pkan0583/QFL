@@ -55,10 +55,7 @@ def get_etf_vol_universe():
     # # Need a data quality "liquidity" test
     # tickers = [str(t) for t in d['ticker'].values.tolist()]
 
-    universe =  ['ACWI',
-                 'AGG',
-                 'BND',
-                 'DIA',
+    universe =  ['DIA',
                  'EEM',
                  'EFA',
                  'EMB',
@@ -231,6 +228,42 @@ def get_generic_index_prices(tickers=None,
                                    index_fields=['date', 'ticker'])
     return prices
 
+def get_equity_tick_realized_volatility(tickers=None,
+                                        fields=None,
+                                        start_date=market_data_date,
+                                        end_date=None):
+
+    if fields is None:
+        fields = ['tick_rv_10d',
+                  'tick_rv_20d',
+                  'tick_rv_60d',
+                  'tick_rv_120d',
+                  'tick_rv_252d',
+                  'rv_10d',
+                  'rv_20d',
+                  'rv_60d',
+                  'rv_120d',
+                  'rv_252d']
+
+    if fields is not None:
+        fs = ""
+        if 'ticker' not in fields:
+            fs += 'ticker, '
+        if 'date' not in fields:
+            fs += 'date, '
+        for field in fields:
+            fs += field + ','
+        fs = fs[0:len(fs)-1]
+
+        s = "select " + fs + " from staging_orats" \
+                             " where ticker in {0}".format(
+                            dbutils.format_for_query(tickers))
+        data = _get_time_series_data(s=s,
+                                     start_date=start_date,
+                                     end_date=end_date,
+                                     index_fields=['date', 'ticker'])
+        return data
+
 
 def get_equity_implied_volatility(tickers=None,
                                   fields=None,
@@ -249,11 +282,11 @@ def get_equity_implied_volatility(tickers=None,
 
     s = "select " + fs + " from staging_orats" \
         " where ticker in {0}".format(dbutils.format_for_query(tickers))
-    prices = _get_time_series_data(s=s,
-                                   start_date=start_date,
-                                   end_date=end_date,
-                                   index_fields=['date', 'ticker'])
-    return prices
+    data = _get_time_series_data(s=s,
+                                 start_date=start_date,
+                                 end_date=end_date,
+                                 index_fields=['date', 'ticker'])
+    return data
 
 
 def get_equity_prices(tickers=None,
@@ -491,6 +524,19 @@ VOLATILITY SURFACE MANAGER
 """
 
 
+class RealizedVolatilityManager(object):
+
+    data=None
+
+    def __init__(self):
+
+        # Initialize data struture
+        tickers = ['SPY']
+        start_date = utils.workday(num_days=-2)
+        self.data = get_equity_prices(tickers=tickers,
+                                      start_date=start_date)
+
+
 class VolatilitySurfaceManager(object):
 
     data=None
@@ -525,11 +571,36 @@ class VolatilitySurfaceManager(object):
 
         self.data = self.data.append(data_1).drop_duplicates()
 
+    def clean_data(self):
+
+        # # Cleaning implied volatility data
+        # clean_ivol = pd.DataFrame(index=ivol.index, columns=ivol.columns)
+        #
+        # clean_ivol['iv_2m'], normal_tests_2m = calcs.clean_implied_vol_data(
+        #     tickers=tickers,
+        #     stock_prices=stock_prices,
+        #     ivol=ivol['iv_2m'],
+        #     ref_ivol_ticker='SPY',
+        #     deg_f=5,
+        #     res_com=5
+        # )
+        #
+        # clean_ivol['iv_3m'], normal_tests_3m = calcs.clean_implied_vol_data(
+        #     tickers=tickers,
+        #     stock_prices=stock_prices,
+        #     ivol=ivol['iv_3m'],
+        #     ref_ivol_ticker='SPY',
+        #     deg_f=5,
+        #     res_com=5
+        # )
+
+        x=1
+
     def get_data(self,
                  tickers=None,
                  fields=None,
                  start_date=None,
-                 end_date=dt.None.today()):
+                 end_date=None):
 
         data = self.data[
             self.data.index.get_level_values('ticker').isin(tickers)]
@@ -545,7 +616,43 @@ class VolatilitySurfaceManager(object):
 
         return data
 
+    def get_roll_schedule(self,
+                          tickers=None,
+                          start_date=history_default_start_date,
+                          end_date=dt.datetime.today()):
+
+        maturity_dates = dict()
+
+        data = self.get_data(tickers=tickers,
+                             start_date=start_date,
+                             end_date=end_date)
+
+        for ticker in tickers:
+
+            tk_data = data[data.index.get_level_values('ticker') == ticker]
+            days_to_maturity = tk_data[['days_to_maturity_1mc',
+                                        'days_to_maturity_2mc',
+                                        'days_to_maturity_3mc',
+                                        'days_to_maturity_4mc']]
+
+            # Pick a conservative interval, loop, find contracts
+            interval = 10
+            tmp_range = range(0, len(tk_data), interval)
+            dates = data.index.get_level_values('date')
+            if len(data) - 1 not in tmp_range:
+                tmp_range += [len(data) - 1]
+            maturity_dates[ticker] = list()
+            for t in tmp_range:
+                mat = utils.calendarday(
+                    date=dates[t],
+                    num_days=days_to_maturity.iloc[t]).tolist()
+                maturity_dates[ticker].append(mat)
+            maturity_dates[ticker] = np.unique(maturity_dates[ticker])
+
+        return maturity_dates
+
     def get_surface_point(self,
+                          data=None,
                           tickers=None,
                           call_delta=0.50,
                           tenor_in_days=21,
@@ -555,7 +662,8 @@ class VolatilitySurfaceManager(object):
         """
         This interpolates a single point on the constant-maturity volatility
         surface in delta terms.
-        :param tickers:
+        :param tickers: list
+        :param data: this is optional (DataFrame)
         :param call_delta:
         :param tenor_in_days:
         :param start_date:
@@ -564,16 +672,21 @@ class VolatilitySurfaceManager(object):
         """
 
         # current data source limitation
-        tenor_in_days = max(21, min(63, tenor_in_days))
-        tenors_in_days = [21, 42, 63]
+        raw_data_tenors = [21, 42, 63]
+
+        if utils.is_iterable(tenor_in_days):
+            tenor_in_days = np.clip(tenor_in_days, 21, 63)
+        else:
+            tenor_in_days = float(max(21, min(63, tenor_in_days)))
 
         # checking data format
         if call_delta > 1.0:
             call_delta /= 100.0
 
-        data = self.get_data(tickers=tickers,
-                             start_date=start_date,
-                             end_date=end_date)
+        if data is None:
+            data = self.get_data(tickers=tickers,
+                                 start_date=start_date,
+                                 end_date=end_date)
 
         # We store data in this format:
         # IV = ATMIV * (1 + slope/1000 +
@@ -582,18 +695,27 @@ class VolatilitySurfaceManager(object):
         # We store the 1-month (21-day) skew/crv the 'inf' skew/crv
         # skew = w * 1m_skew + (1-w) * inf_skew
         # w = sqrt(21)/sqrt(252)
-        w = (constants.trading_days_per_month / float(tenor_in_days)) ** 0.5
-        if w > 1.0:
-            w = 1.0
+        w = (constants.trading_days_per_month / tenor_in_days) ** 0.5
+        if utils.is_iterable(w):
+            w = np.clip(w, 0, 1)
+        else:
+            if w > 1.0:
+                w = 1.0
 
         skew = w * data['skew'] + (1-w) * data['skew_inf']
         curve = w * data['curvature'] + (1-w) * data['curvature_inf']
 
-        tmp_int = interp1d(tenors_in_days,
+        tmp_int = interp1d(raw_data_tenors,
                            data[['iv_1m', 'iv_2m', 'iv_3m']] ** 2.0)
 
         # This is the ATM
         atm_iv = tmp_int(tenor_in_days) ** 0.5
+
+        # Special case: raw_data_tenors was an iterable that matched the length
+        # of the data, which means we want a different tenor for each row
+        if utils.is_iterable(tenor_in_days):
+            if len(tenor_in_days) == len(data):
+                atm_iv = np.diag(atm_iv)
 
         # Now we adjust for the delta
         if call_delta == 0.5:

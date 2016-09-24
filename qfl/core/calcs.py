@@ -191,13 +191,19 @@ def clean_implied_vol_data(tickers=None,
                            ivol=None,
                            ref_ivol_ticker=None,
                            res_com=5,
-                           deg_f=2,
+                           deg_f=4,
                            buffer_days=3,
                            pct_threshold=0.0001,
                            calendar_name='UnitedStates'):
 
+    orig_ivol = ivol.copy(deep=True)
     ivol = ivol.copy(deep=True)
-    clean_ivol = pd.DataFrame(index=ivol.index, columns=ivol.columns)
+    stock_prices = stock_prices.copy(deep=True)
+
+    if isinstance(ivol, pd.DataFrame):
+        clean_ivol = pd.DataFrame(index=ivol.index, columns=ivol.columns)
+    elif isinstance(ivol, pd.Series):
+        clean_ivol = pd.DataFrame(index=ivol.index, columns=tickers)
     normal_tests = pd.DataFrame(index=tickers, columns=['stat'])
 
     for ticker in tickers:
@@ -217,7 +223,10 @@ def clean_implied_vol_data(tickers=None,
                 pct_threshold=pct_threshold,
                 buffer_days=buffer_days,
                 res_com=res_com,
-                deg_f=deg_f)
+                deg_f=deg_f,
+                calendar_name=calendar_name)
+
+            clean_ivol_tmp = clean_ivol_tmp[np.isfinite(clean_ivol_tmp)]
 
             clean_ivol[ticker], tmp_pr_, r1_ = _clean_implied_vol_data_one(
                 stock_prices=stock_prices[ticker],
@@ -226,12 +235,16 @@ def clean_implied_vol_data(tickers=None,
                 pct_threshold=pct_threshold,
                 buffer_days=buffer_days,
                 res_com=res_com,
-                deg_f=deg_f)
+                deg_f=deg_f,
+                calendar_name=calendar_name)
 
             normal_tests.loc[ticker, 'stat'] = normaltest(r1.resid).statistic
 
         except:
             print('failed!')
+
+    orig_ivol.loc[clean_ivol.index] = clean_ivol.values
+    clean_ivol = orig_ivol
 
     return clean_ivol, normal_tests
 
@@ -242,10 +255,11 @@ def _clean_implied_vol_data_one(stock_prices=None,
                                 res_com=5,
                                 deg_f=2,
                                 buffer_days=3,
-                                pct_threshold=0.0001,
+                                pct_threshold=0.01,
                                 calendar_name='UnitedStates'):
 
     ivol = ivol.copy(deep=True)
+    ivol = ivol[np.isfinite(ivol)]
 
     df = pd.DataFrame(index=ivol.index,
                       columns=['px', 'ivol', 'ret', 'ivol_chg'])
@@ -253,14 +267,15 @@ def _clean_implied_vol_data_one(stock_prices=None,
     df['ivol'] = ivol
     df = df[np.isfinite(df['px'])]
     df['ret'] = df['px'] / df['px'].shift(1) - 1
-    df['ivol_chg'] = df['ivol'] / df['ivol'].shift(1) - 1
+    df['ivol_chg'] = np.log(df['ivol'] / df['ivol'].shift(1))
 
     # Idea is that first we should predict ivol change based on stock chg
     # And then we should filter outliers from there
 
     x = df['ret']
     if ref_ivol is not None:
-        df['ref_ivol_chg'] = ref_ivol
+        ref_ivol = ref_ivol[np.isfinite(ref_ivol)]
+        df['ref_ivol_chg'] = np.log(ref_ivol / ref_ivol.shift(1))
         x = df[['ret', 'ref_ivol_chg']]
     r1 = pd.ols(y=df['ivol_chg'], x=x)
     df['ivol_chg_res'] = r1.resid
@@ -271,13 +286,20 @@ def _clean_implied_vol_data_one(stock_prices=None,
     # So "probability of being an outlier" is some function of a large residual
     # followed by negative residuals
 
+    # df['ivol_chg_res_fwd_ewm'] = df['ivol_chg_res'] \
+    #                                  .iloc[::-1] \
+    #                                  .ewm(com=res_com) \
+    #                                  .mean() \
+    #                                  .iloc[::-1] \
+    #                                  .shift(-1) \
+    #                                  * res_com
+
     df['ivol_chg_res_fwd_ewm'] = df['ivol_chg_res'] \
                                      .iloc[::-1] \
-                                     .ewm(com=res_com) \
-                                     .mean() \
+                                     .rolling(window=res_com) \
+                                     .sum() \
                                      .iloc[::-1] \
-                                     .shift(-1) \
-                                     * res_com
+                                     .shift(-1)
 
     max_date = np.max(df.index)
     df['ivol_chg_res_fwd_ewm'].loc[max_date] = 0
@@ -448,7 +470,11 @@ def volswap_market_value(iv=None,
                 calendar_name=calendar_name)
 
     # Weighted average of implied and realized
-    rlzd_weight = float(days_elapsed) / total_days
+    if isinstance(days_elapsed, int):
+        days_elapsed = float(days_elapsed)
+    elif utils.is_iterable(days_elapsed):
+        days_elapsed = days_elapsed.astype(float)
+    rlzd_weight = days_elapsed / total_days
 
     ev = (iv ** 2 * (1 - rlzd_weight) + rv ** 2 * rlzd_weight) ** 0.5
     return ev - strike
