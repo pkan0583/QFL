@@ -648,11 +648,11 @@ class VolswapRvStrategy(PortfolioStrategy):
             # Now loop over the delta range to get all the individual options
             sec_dict = dict()
             for call_delta in call_deltas_initial_position:
-                vols = self.vsm.get_surface_point(tickers=underlyings,
-                                                  call_delta=call_delta,
-                                                  tenor_in_days=tenor_in_days,
-                                                  start_date=trade_date,
-                                                  end_date=trade_date) \
+                vols = self.vsm.get_surface_point_by_delta(tickers=underlyings,
+                                                           call_delta=call_delta,
+                                                           tenor_in_days=tenor_in_days,
+                                                           start_date=trade_date,
+                                                           end_date=trade_date) \
                     .reset_index(level='date', drop=True)
 
                 sec_dict[call_delta] = securities.copy()

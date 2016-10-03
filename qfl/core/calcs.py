@@ -442,6 +442,145 @@ def linear_setup(df, ind_cols, dep_col):
     return pymc.Model(
         [b0, pymc.Container(b), err, pymc.Container(x), y, y_pred])
 
+'''
+--------------------------------------------------------------------------------
+Volatility swaps
+--------------------------------------------------------------------------------
+'''
+
+
+def black_scholes_price(spot=None,
+                        strike=None,
+                        tenor_in_days=None,
+                        risk_free=None,
+                        ivol=None,
+                        div_amt=None,
+                        d1=None,
+                        option_type='c'):
+
+    t = tenor_in_days / constants.trading_days_per_year
+    pv_div = np.exp(-t * risk_free) * div_amt
+    adj_spot = spot - pv_div
+
+    if d1 is None:
+        d1 = (np.log(adj_spot / strike) + (risk_free + ivol ** 2.0 / 2.0) * t)\
+             / (ivol * t ** 0.5)
+    d2 = d1 - ivol * t ** 0.5
+
+    if option_type.upper() in (['C', 'CALL']):
+        price = adj_spot * norm.cdf(d1) \
+                - np.exp(-risk_free * t) * strike * norm.cdf(d2)
+    elif option_type.upper() in (['P', 'PUT']):
+        price = strike * np.exp(-risk_free * t) * norm.cdf(-d2) \
+                - spot * norm.cdf(-d1)
+
+    return price
+
+
+def put_call_parity(input_price=None,
+                    option_type='c',
+                    spot=None,
+                    strike=None,
+                    div_amt=None,
+                    risk_free=None,
+                    tenor_in_days=None):
+
+    t = tenor_in_days / constants.trading_days_per_year
+    pv_div = np.exp(-t * risk_free) * div_amt
+
+    # cash plus call plus divs equals put plus stock
+    if option_type.upper() in (['C', 'CALL']):
+        other_price = input_price + spot \
+                      - np.exp(risk_free * t) * strike - pv_div
+    elif option_type.upper() in (['P', 'PUT']):
+        other_price = np.exp(risk_free * t) * strike + pv_div - spot
+    return other_price
+
+
+def black_scholes_delta(spot=None,
+                        strike=None,
+                        tenor_in_days=None,
+                        risk_free=None,
+                        ivol=None,
+                        div_amt=None,
+                        d1=None):
+
+    t = tenor_in_days / constants.trading_days_per_year
+    pv_div = np.exp(-t * risk_free) * div_amt
+    adj_spot = spot - pv_div
+    div_yield = div_amt / spot / t
+
+    if d1 is None:
+        d1 = black_scholes_d1(spot=spot,
+                              strike=strike,
+                              tenor_in_days=tenor_in_days,
+                              risk_free=risk_free,
+                              ivol=ivol,
+                              div_amt=div_amt)
+
+    delta = np.exp(-div_yield * t) * norm.cdf(d1)
+
+    return delta
+
+
+def black_scholes_d1(spot=None,
+                     strike=None,
+                     tenor_in_days=None,
+                     risk_free=None,
+                     ivol=None,
+                     div_amt=None):
+
+    t = tenor_in_days / constants.trading_days_per_year
+    pv_div = np.exp(-t * risk_free) * div_amt
+    adj_spot = spot - pv_div
+    d1 = (np.log(adj_spot / strike) + (risk_free + ivol ** 2.0 / 2.0) * t) \
+         / (ivol * t ** 0.5)
+    return d1
+
+
+def black_scholes_moneyness_from_delta(call_delta=None,
+                                       tenor_in_days=None,
+                                       ivol=None,
+                                       risk_free=None,
+                                       div_yield=None):
+
+    """
+    :param call_delta: this can be a scalar or an array-like. If the latter,
+    ivol needs to have call delta as its columns
+    :param tenor_in_days: this can be an integer or a Series with index that
+    matches ivol's index
+    :param ivol: this can be a scalar, a series, or a DataFrame indexed on
+    date and/or ticker, with columns = call delta
+    :param risk_free: can be scalar or series
+    :param div_yield: can be scalar or series
+    :return: scalar, series or DataFrame depending on inputs
+    """
+
+    if isinstance(call_delta, list):
+        call_delta = np.array(call_delta)
+
+    put_delta = 1.0 - call_delta
+    t = tenor_in_days / constants.trading_days_per_year
+
+    if isinstance(tenor_in_days, pd.Series) and isinstance(ivol, pd.DataFrame):
+        m = pd.DataFrame(index=ivol.index, columns=ivol.columns)
+        for col in ivol.columns:
+            m[col] = np.exp(ivol[col] * t ** 0.5 * norm.ppf(
+                (1 - col) * np.exp(div_yield * t))
+                     - (risk_free - div_yield - ivol[col] ** 2.0 / 2.0) * t)
+    else:
+        m = np.exp(ivol * t ** 0.5 * norm.ppf(put_delta * np.exp(div_yield * t))
+                     - (risk_free - div_yield - ivol ** 2.0 / 2.0) * t)
+    return m
+
+
+def round_to_sig_dig(x=None, num_digits=1):
+    if isinstance(x, pd.Series) or isinstance(x, pd.DataFrame):
+        d = np.floor(1 - num_digits + np.log10(np.abs(x)))
+        output = x.round(-d.astype(int))
+    else:
+        output = round(x, -int(np.floor(1 - num_digits + np.log10(np.abs(x)))))
+    return output
 
 '''
 --------------------------------------------------------------------------------

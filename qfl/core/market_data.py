@@ -14,7 +14,7 @@ from qfl.core.database_interface import DatabaseUtilities as dbutils
 
 from scipy.interpolate import interp1d
 
-market_data_date = utils.workday(dt.datetime.today(), num_days=-1)
+market_data_date = utils.workday(dt.datetime.today().date(), num_days=-1)
 history_default_start_date = dt.datetime(2000, 1, 1)
 option_delta_grid = [1] + range(5, 95, 5) + [99]
 
@@ -33,6 +33,143 @@ def get_futures_calendar_name(futures_series=None):
     exchange_code = s.iloc[0]['exchange']
     calendar_name = utils.DateUtils.exchange_calendar_map[exchange_code]
     return calendar_name
+
+
+"""
+-------------------------------------------------------------------------------
+MARKET DATA MANAGER
+-------------------------------------------------------------------------------
+"""
+
+
+class MarketDataManager(object):
+
+    # Objective here is to provide generic loading and storage with caching
+
+    data_categories = [
+        'equity_price',
+        'equity_implied_volatility',
+        'futures_price',
+        'generic_futures_price',
+        'futures_implied_volatility',
+        'yield_curve',
+        'currency',
+        'equity_index_price'
+    ]
+
+    cached_data = dict()
+    cache_manager = dict()
+    vsm = None
+
+    def __init__(self):
+
+        cols = ['ticker', 'start_date', 'end_date']
+        for data_category in self.data_categories:
+            self.cache_manager[data_category] = pd.DataFrame(columns=cols)
+
+        vsm = VolatilitySurfaceManager()
+
+    def get_data(self,
+                 data_category=None,
+                 tickers=None,
+                 start_date=history_default_start_date,
+                 end_date=market_data_date,
+                 **kwargs):
+
+        if 1 == 1:
+            pass
+        elif data_category == 'equity_implied_volatility':
+
+            moneyness = kwargs.get('moneyness', None)
+            delta = kwargs.get('moneyness', None)
+            tenor_in_days = kwargs.get('tenor_in_days', None)
+            maturity_date = kwargs.get('maturity_date', None)
+            fields = kwargs.get('fields', None)
+
+            if delta is not None and tenor_in_days is not None:
+                req_data = self.vsm.get_surface_point_by_delta(
+                    tickers=tickers,
+                    start_date=start_date,
+                    end_date=end_date,
+                    call_delta=delta
+                )
+            else:
+                req_data = get_equity_implied_volatility(tickers=tickers,
+                                                         fields=fields,
+                                                         start_date=start_date,
+                                                         end_date=end_date)
+
+            return req_data
+
+    def _load_data(self,
+                   data_category,
+                   tickers=None,
+                   start_date=history_default_start_date,
+                   end_date=market_data_date,
+                   **kwargs):
+
+        if data_category == 'equity_price':
+
+            price_field = kwargs.get('price_field', 'adj_close')
+            req_data = get_equity_prices(tickers=tickers,
+                                         start_date=start_date,
+                                         end_date=end_date,
+                                         price_field=price_field)
+
+        elif data_category == 'equity_implied_volatility':
+
+            self.vsm.load_data(tickers=tickers,
+                               start_date=start_date,
+                               end_date=end_date)
+
+        elif data_category == 'equity_index_price':
+
+            price_field = kwargs.get('price_field', 'last_price')
+            req_data = get_equity_index_prices(tickers=tickers,
+                                               start_date=start_date,
+                                               end_date=end_date,
+                                               price_field=price_field)
+
+        elif data_category == 'futures_price':
+
+            by_series = kwargs.get('by_series', True)
+            if by_series:
+                req_data = get_futures_prices_by_series(futures_series=tickers,
+                                                        start_date=start_date,
+                                                        end_date=end_date)
+            else:
+                req_data = get_futures_prices_by_tickers(tickers=tickers,
+                                                         start_date=start_date,
+                                                         end_date=end_date)
+
+        elif data_category == 'generic_futures_price':
+
+            constant_maturity = False
+
+            if constant_maturity:
+                req_data = get_constant_maturity_futures_prices_by_series(
+                    futures_series=tickers,
+                    start_date=start_date,
+                    end_date=end_date,
+
+                )
+            else:
+                req_data = get_generic_futures_prices_by_series(
+                        futures_series=tickers,
+                        start_date=start_date,
+                        end_date=end_date)
+
+
+
+
+        # Initialize the dataset if necessary
+        if data_category not in self.cached_data:
+            self.cached_data[data_category] = req_data
+
+        # Drop duplicate rows and sort
+        df = self.cached_data[data_category].append(req_data)
+        df = df.groupby(level=df.index.names).last().sort_index()
+        self.cached_data[data_category] = df
 
 """
 -------------------------------------------------------------------------------
@@ -228,6 +365,7 @@ def get_generic_index_prices(tickers=None,
                                    index_fields=['date', 'ticker'])
     return prices
 
+
 def get_equity_tick_realized_volatility(tickers=None,
                                         fields=None,
                                         start_date=market_data_date,
@@ -287,6 +425,20 @@ def get_equity_implied_volatility(tickers=None,
                                  end_date=end_date,
                                  index_fields=['date', 'ticker'])
     return data
+
+
+def get_equity_index_prices(tickers=None,
+                            price_field='last_price',
+                            start_date=market_data_date,
+                            end_date=None):
+    s = "select ticker, date, " + price_field \
+        + " from equity_index_prices_view" \
+        + " where ticker in {0}".format(dbutils.format_for_query(tickers))
+    prices = _get_time_series_data(s=s,
+                                   start_date=start_date,
+                                   end_date=end_date,
+                                   index_fields=['date', 'ticker'])
+    return prices
 
 
 def get_equity_prices(tickers=None,
@@ -571,6 +723,15 @@ class VolatilitySurfaceManager(object):
 
         self.data = self.data.append(data_1).drop_duplicates()
 
+        dates = self.data.index.get_level_values('date')
+        for i in range(1, 5):
+            col1 = 'maturity_date_' + str(i) + 'mc'
+            col2 = 'days_to_maturity_' + str(i) + 'mc'
+            self.data[col1] = \
+                utils.calendarday(date=dates, num_days=self.data[col2])
+
+        self.data = self.data.sort_index()
+
     def clean_data(self):
 
         # # Cleaning implied volatility data
@@ -594,7 +755,7 @@ class VolatilitySurfaceManager(object):
         #     res_com=5
         # )
 
-        x=1
+        pass
 
     def get_data(self,
                  tickers=None,
@@ -651,13 +812,116 @@ class VolatilitySurfaceManager(object):
 
         return maturity_dates
 
-    def get_surface_point(self,
-                          data=None,
-                          tickers=None,
-                          call_delta=0.50,
-                          tenor_in_days=21,
-                          start_date=history_default_start_date,
-                          end_date=dt.datetime.today()):
+    def get_surface_point_by_moneyness(
+            self,
+            data=None,
+            tickers=None,
+            moneyness=[1.0],
+            tenor_in_days=21,
+            start_date=history_default_start_date,
+            end_date=dt.datetime.today()):
+
+        pass
+
+    def get_fixed_maturity_vol_by_strike(
+            self,
+            ticker=None,
+            strikes=None,
+            contract_month_number=1,
+            tenor_in_days=None,
+            start_date=history_default_start_date,
+            end_date=dt.datetime.today(),
+            strike_as_moneyness=False):
+
+        """
+        Get a time series of implied volatilities for a fixed-maturity
+        Maturity is a time series
+        :param ticker:
+        :param strikes:
+        :param contract_month_number:
+        :param start_date:
+        :param end_date:
+        :param strike_as_moneyness:
+        :return:
+        """
+
+        delta_grid = np.append([0.001, 0.01],
+                               np.append(np.arange(0.05, 1.0, 0.05),
+                                         [0.99, 0.999]))
+
+        if tenor_in_days is None:
+            fm_data = self.get_data(tickers=[ticker],
+                                    start_date=start_date,
+                                    end_date=end_date)
+            fm_data = fm_data[['iv_1mc', 'iv_2mc', 'iv_3m', 'iv_4mc',
+                           'days_to_maturity_1mc', 'days_to_maturity_2mc',
+                           'days_to_maturity_3mc', 'days_to_maturity_4mc',
+                           'skew', 'curvature', 'skew_inf', 'curvature_inf']]
+            tenor_string = 'days_to_maturity_' + str(
+                contract_month_number) + 'mc'
+            tenor_in_days = fm_data[tenor_string]\
+                .reset_index(level='ticker', drop=True)
+
+        fm_vols = self.get_surface_point_by_delta(
+            tickers=[ticker],
+            call_delta=delta_grid.tolist(),
+            tenor_in_days=tenor_in_days,
+            start_date=start_date,
+            end_date=end_date).reset_index(level='ticker', drop=True)
+
+        fm_m = calcs.black_scholes_moneyness_from_delta(
+            call_delta=delta_grid.tolist(),
+            tenor_in_days=tenor_in_days,
+            ivol=fm_vols / 100.0,
+            risk_free=0,
+            div_yield=0)
+
+        sp = get_equity_prices(tickers=[ticker], start_date=start_date) \
+            ['adj_close'] \
+            .reset_index(level='ticker', drop=True)
+
+        if strike_as_moneyness:
+            strike_money = strikes
+        else:
+            strike_data = pd.DataFrame(index=sp.index, columns=strikes)
+            for strike in strikes:
+                strike_data[strike] = strike / sp
+            strike_money = pd.DataFrame(index=fm_m.index, columns=strikes,
+                                        data=strike_data)
+
+        interp_vols = pd.DataFrame(index=fm_vols.index, columns=strikes)
+        min_m_vol = fm_vols[delta_grid.min()]
+        max_m_vol = fm_vols[delta_grid.max()]
+
+        for t in range(0, len(fm_vols.index) - 1):
+            date = fm_vols.index[t]
+            tmp = interp1d(x=fm_m.loc[date], y=fm_vols.loc[date],
+                           bounds_error=False)
+            interp_vols.loc[date] = tmp(strike_money.loc[date])
+            # hi_ind = interp_vols.loc[date].index[
+            #     strike_money.iloc[t] < fm_m.loc[date].min()]
+            # lo_ind = interp_vols.loc[date].index[
+            #     strike_money.iloc[t] > fm_m.loc[date].max()]
+            # interp_vols.loc[date, lo_ind] = min_m_vol.loc[date]
+            # interp_vols.loc[date, hi_ind] = max_m_vol.loc[date]
+
+        for strike in strikes:
+            hi_ind = interp_vols[strike].index[
+                strike_money[strike] < fm_m.min(axis=1)]
+            lo_ind = interp_vols[strike].index[
+                strike_money[strike] > fm_m.max(axis=1)]
+            interp_vols.loc[lo_ind, strike] = min_m_vol.loc[lo_ind]
+            interp_vols.loc[hi_ind, strike] = max_m_vol.loc[hi_ind]
+
+        return interp_vols
+
+    def get_surface_point_by_delta(self,
+                                   data=None,
+                                   tickers=None,
+                                   call_delta=[0.50],
+                                   tenor_in_days=21,
+                                   start_date=history_default_start_date,
+                                   end_date=dt.datetime.today()):
 
         """
         This interpolates a single point on the constant-maturity volatility
@@ -671,6 +935,9 @@ class VolatilitySurfaceManager(object):
         :return:
         """
 
+        if not utils.is_iterable(call_delta):
+            call_delta = [call_delta]
+
         # current data source limitation
         raw_data_tenors = [21, 42, 63]
 
@@ -680,21 +947,14 @@ class VolatilitySurfaceManager(object):
             tenor_in_days = float(max(21, min(63, tenor_in_days)))
 
         # checking data format
-        if call_delta > 1.0:
-            call_delta /= 100.0
+        if call_delta[0] > 1.0:
+            call_delta = [cd / 100.0 for cd in call_delta]
 
         if data is None:
             data = self.get_data(tickers=tickers,
                                  start_date=start_date,
                                  end_date=end_date)
 
-        # We store data in this format:
-        # IV = ATMIV * (1 + slope/1000 +
-        #      (curve/1000 * (delta*100 - 50)/2) * delta*100-50))
-
-        # We store the 1-month (21-day) skew/crv the 'inf' skew/crv
-        # skew = w * 1m_skew + (1-w) * inf_skew
-        # w = sqrt(21)/sqrt(252)
         w = (constants.trading_days_per_month / tenor_in_days) ** 0.5
         if utils.is_iterable(w):
             w = np.clip(w, 0, 1)
@@ -711,19 +971,25 @@ class VolatilitySurfaceManager(object):
         # This is the ATM
         atm_iv = tmp_int(tenor_in_days) ** 0.5
 
-        # Special case: raw_data_tenors was an iterable that matched the length
+        # Special case: tenor_in_days was an iterable that matched the length
         # of the data, which means we want a different tenor for each row
         if utils.is_iterable(tenor_in_days):
             if len(tenor_in_days) == len(data):
                 atm_iv = np.diag(atm_iv)
 
-        # Now we adjust for the delta
-        if call_delta == 0.5:
-            iv = atm_iv
-        else:
-            iv = atm_iv * (1 + (call_delta * 100.0 - 50.0) *
-                (skew / 1000.0 + (curve / 1000.0 *
-                (call_delta * 100 - 50.0) / 2.0)))
+        # Now we adjust for delta
+        iv = pd.DataFrame(index=data.index, columns=call_delta)
+        for delta in call_delta:
+            if delta == 0.5:
+                iv[delta] = atm_iv
+            else:
+                cd = (delta * 100.0 - 50.0)
+                iv[delta] = atm_iv * (1 + cd *
+                    (skew / 1000.0 + (curve / 1000.0 * cd / 2.0)))
+
+        # Return series if only a single delta request
+        if len(call_delta) == 1:
+            iv = iv[call_delta[0]]
 
         return iv
 

@@ -6,6 +6,7 @@ import numpy as np
 import seaborn as sn
 import datetime as dt
 
+import qfl.core.market_data as md
 import qfl.utilities.chart_utilities as chart_utils
 import qfl.macro.macro_models as macro
 
@@ -16,16 +17,13 @@ Hedge fund AUM
 -------------------------------------------------------------------------------
 """
 
-line_color = 'b'
-text_color_scheme = 'red'
-background_color = 'black'
-
+text_color_scheme = 'r'
 hf_aum = pd.read_excel(io='data/AUM_HF.xls', sheetname='raw')
 
 hf_aum.index = hf_aum['YEAR']
 fig = plt.figure(figsize=[12, 6])
 ax = fig.add_subplot(1,1,1)
-ax.plot(hf_aum['AUM'], line_color)
+ax.plot(hf_aum['AUM'])
 ax.set_ylabel('Hedge fund industry AUM, $ billions')
 ax.set_xlim([hf_aum['YEAR'].min(), hf_aum['YEAR'].max()])
 plt.xticks(hf_aum['YEAR'].values)
@@ -34,11 +32,6 @@ for xy in zip(hf_aum['YEAR'].values, hf_aum['AUM'].values):
                 xy=xy,
                 textcoords='data',
                 color=text_color_scheme)
-
-chart_utils.format_plot(ax,
-                        text_color_scheme=text_color_scheme,
-                        background_color=background_color)
-
 plt.savefig('figures/aum_fig.png',
             facecolor='k',
             edgecolor='k',
@@ -50,18 +43,15 @@ GURU chart
 -------------------------------------------------------------------------------
 """
 
-line_color = 'b'
-text_color_scheme = 'red'
-background_color = 'black'
-
 guru_price = pd.read_excel('data/guru.xlsx')
 guru_start_date = guru_price['date'].min()
 guru_price.index = guru_price['date']
-spx_price = pdata.get_data_yahoo('^GSPC', guru_start_date)
-spx_price = spx_price['Adj Close']
+
+spx_price = md.get_equity_index_prices(['SPX'], start_date=guru_start_date)
+spx_price = spx_price['last_price']
 
 prices = pd.DataFrame(data=guru_price)
-prices['SPX'] = spx_price
+prices['SPX'] = spx_price.reset_index(level='ticker', drop=True)
 prices = prices.rename(columns={'price': 'GURU'})
 
 prices = prices.sort_index()
@@ -83,9 +73,6 @@ fig = plt.figure(figsize=[12, 6])
 ax = fig.add_subplot(1,1,1)
 ax.plot(100 * cumulative_returns['risk-adj diff'], 'b')
 ax.set_ylabel('Cumulative outperformance of GURU vs S&P 500, %')
-chart_utils.format_plot(ax,
-                        text_color_scheme=text_color_scheme,
-                        background_color=background_color)
 yticks = mtick.FormatStrFormatter('%.0f%%')
 ax.yaxis.set_major_formatter(yticks)
 
@@ -144,6 +131,34 @@ plt.show()
 plt.figure()
 plt.plot(plot_data['lev_pnl'].cumsum())
 
+
+"""
+-------------------------------------------------------------------------------
+Volatility convexity chart
+-------------------------------------------------------------------------------
+"""
+
+# Var/vol with a cap
+
+var_strike = 18
+vol_strike = 16
+cap_factor = 2.5
+cap_sale_ratio = 0.6
+vol_grid = np.arange(0.0, 100.0, 5.0)
+
+df = pd.DataFrame(index=vol_grid, columns=['var', 'vol', 'cap'])
+df['var'] = (vol_grid ** 2 - var_strike ** 2) / (2 * var_strike)
+df['vol'] = vol_grid - vol_strike
+df['cap'] = (vol_grid ** 2 - (var_strike * cap_factor) ** 2) / (2 * var_strike)
+df['cap'][df['cap'] < 0] = 0
+df['cap_ratio'] = df['cap'] * cap_sale_ratio
+df['var_vol'] = df['var'] - df['vol']
+df['package'] = df['var_vol'] - df['cap_ratio']
+
+plt.figure()
+plt.plot(df['var_vol'])
+plt.plot(df['cap_ratio'])
+plt.plot(df['package'])
 
 """
 -------------------------------------------------------------------------------

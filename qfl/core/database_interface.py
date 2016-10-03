@@ -563,8 +563,8 @@ class DatabaseInterface(object):
         cls.tables['staging_orats'] = orats_staging_table
 
         # CLEAN EQUITY IMPLIED VOLATILITY
-        equity_implied_volatility_table = sa.Table(
-            'equity_implied_volatility', cls.metadata,
+        equity_implied_volatilities_table = sa.Table(
+            'equity_implied_volatilities', cls.metadata,
             sa.Column('ticker', sa.String(32), primary_key=True),
             sa.Column('date', sa.Date, primary_key=True),
             sa.Column('underlying_price', sa.Float),
@@ -572,30 +572,24 @@ class DatabaseInterface(object):
             sa.Column('iv_2m', sa.Float),
             sa.Column('iv_3m', sa.Float),
             sa.Column('iv_1mc', sa.Float),
-            sa.Column('days_to_maturity_1mc', sa.Float),
             sa.Column('iv_2mc', sa.Float),
-            sa.Column('days_to_maturity_2mc', sa.Float),
             sa.Column('iv_3mc', sa.Float),
-            sa.Column('days_to_maturity_3mc', sa.Float),
             sa.Column('iv_4mc', sa.Float),
+            sa.Column('days_to_maturity_1mc', sa.Float),
+            sa.Column('days_to_maturity_2mc', sa.Float),
+            sa.Column('days_to_maturity_3mc', sa.Float),
             sa.Column('days_to_maturity_4mc', sa.Float),
-            sa.Column('skew', sa.Float),
-            sa.Column('curvature', sa.Float),
-            sa.Column('skew_inf', sa.Float),
-            sa.Column('curvature_inf', sa.Float),
-            sa.Column('rv_10d', sa.Float),
-            sa.Column('rv_20d', sa.Float),
-            sa.Column('rv_60d', sa.Float),
-            sa.Column('rv_120d', sa.Float),
-            sa.Column('rv_252d', sa.Float),
-            sa.Column('tick_rv_10d', sa.Float),
-            sa.Column('tick_rv_20d', sa.Float),
-            sa.Column('tick_rv_60d', sa.Float),
-            sa.Column('tick_rv_120d', sa.Float),
-            sa.Column('tick_rv_252d', sa.Float)
+            sa.Column('skew_delta', sa.Float),
+            sa.Column('curvature_delta', sa.Float),
+            sa.Column('skew_inf_delta', sa.Float),
+            sa.Column('curvature_inf_delta', sa.Float),
+            sa.Column('skew_moneyness', sa.Float),
+            sa.Column('curvature_moneyness', sa.Float),
+            sa.Column('skew_inf_moneyness', sa.Float),
+            sa.Column('curvature_inf_moneyness', sa.Float)
         )
-        cls.tables['equity_implied_volatility'] \
-            = equity_implied_volatility_table
+        cls.tables['equity_implied_volatilities'] \
+            = equity_implied_volatilities_table
 
         # STAGING TABLES FOR OPTIONWORKS
         optionworks_ivm_staging_table = sa.Table(

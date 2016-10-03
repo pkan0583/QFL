@@ -11,49 +11,51 @@ from scipy.optimize import minimize
 
 class Strategy(object):
 
-    data = struct
-    calc = struct
-    settings = struct
+    def __init__(self, name):
 
-    @classmethod
-    def compute_signal_z(cls, **kwargs):
+        self.name = name
+        self.strat_data = struct
+        self.calc = struct
+        self.settings = struct
+        self.name = None
 
-        signals_data = kwargs.get('signals_data', None)
+    def compute_signal_z(self, **kwargs):
+
+        signal_data = kwargs.get('signal_data', None)
         expanding = kwargs.get('expanding', True)
         signals_z_cap = kwargs.get('signals_z_cap', 2.0)
         if not expanding:
             com = kwargs.get('window', 252)
 
         if expanding:
-            signals_data_z = (signals_data
-                            - signals_data.expanding().mean()) \
-                            / signals_data.expanding().std()
+            signal_data_z = (signal_data
+                            - signal_data.expanding().mean()) \
+                            / signal_data.expanding().std()
         else:
-            signals_data_z = (signals_data
-                             - signals_data.ewm(com=com).mean()) \
-                            / signals_data.ewm(com=com).std()
+            signal_data_z = (signal_data
+                             - signal_data.ewm(com=com).mean()) \
+                            / signal_data.ewm(com=com).std()
 
-        signals_data_z = signals_data_z.clip(lower=-signals_z_cap,
+        signal_data_z = signal_data_z.clip(lower=-signals_z_cap,
                                              upper=signals_z_cap)
 
-        return signals_data_z
+        return signal_data_z
 
-    @classmethod
-    def backtest_signals(cls, **kwargs):
+    def backtest_signals(self, **kwargs):
 
-        backtest_data = cls.compute_static_strategy(**kwargs)
+        backtest_data = self.compute_static_strategy(**kwargs)
         dates = backtest_data.index
 
         holding_period_days = kwargs.get('holding_period_days', 1)
         vol_target_com = kwargs.get('vol_target_com', None)
 
-        signals_data_z = cls.compute_signal_z(**kwargs)
+        signal_data_z = self.compute_signal_z(**kwargs)
 
-        backtest_signals = signals_data_z.columns
+        backtest_signals = signal_data_z.columns
         signal_pnl = pd.DataFrame(index=dates,
                                   columns=backtest_signals)
 
-        positions = signals_data_z.shift(holding_period_days)
+        positions = signal_data_z.shift(holding_period_days)
 
         # Volatility target the whole strategy vs the static backtest
         if vol_target_com is not None:
@@ -75,8 +77,7 @@ class Strategy(object):
 
         return signal_pnl, positions
 
-    @classmethod
-    def compute_signal_portfolio_optimization(cls,
+    def compute_signal_portfolio_optimization(self,
                                               signal_er=None,
                                               signal_cov=None,
                                               signal_corr=None,
@@ -128,8 +129,7 @@ class Strategy(object):
 
         return output
 
-    @classmethod
-    def compute_master_backtest(cls, **kwargs):
+    def compute_master_backtest(self, **kwargs):
 
         # Basic parameters
         holding_period_days = kwargs.get('holding_period_days', 1)
@@ -139,7 +139,7 @@ class Strategy(object):
         transaction_cost_per_unit = kwargs.get('transaction_cost_per_unit', 0.05)
 
         # Signals data and PNL
-        signal_output = cls.initialize_signals(**kwargs)
+        signal_output = self.initialize_signals(**kwargs)
 
         signal_er = signal_output.signal_pnl.mean() \
                     * constants.trading_days_per_year
@@ -150,7 +150,7 @@ class Strategy(object):
         signal_corr = signal_output.signal_pnl.corr()
 
         # Optimization
-        optim_output = cls.compute_signal_portfolio_optimization(
+        optim_output = self.compute_signal_portfolio_optimization(
             signal_er=signal_er,
             signal_corr=signal_corr,
             signal_cov=signal_cov,
@@ -162,8 +162,8 @@ class Strategy(object):
         combined_signal[['optim_weight', 'equal_weight']] = 0.0
 
         for signal in optim_output.weights.index:
-            sz = cls.compute_signal_z(
-                signals_data=signal_output.signals_data[signal],
+            sz = self.compute_signal_z(
+                signal_data=signal_output.signal_data[signal],
                 signals_z_cap=signals_z_cap)
             combined_signal['optim_weight'] += optim_output.weights \
                 .loc[signal].values[0] * sz
@@ -174,15 +174,15 @@ class Strategy(object):
         combined_pnl = pd.DataFrame(index=signal_output.signal_pnl.index,
                                     columns=['optim_weight', 'equal_weight'])
 
-        combined_pnl['optim_weight'], optim_positions = cls.backtest_signals(
+        combined_pnl['optim_weight'], optim_positions = self.backtest_signals(
             holding_period_days=holding_period_days,
-            signals_data=pd.DataFrame(combined_signal['optim_weight']),
+            signal_data=pd.DataFrame(combined_signal['optim_weight']),
             vol_target_com=vol_target_com,
             signals_z_cap=signals_z_cap)
 
-        combined_pnl['equal_weight'], ew_positions = cls.backtest_signals(
+        combined_pnl['equal_weight'], ew_positions = self.backtest_signals(
             holding_period_days=holding_period_days,
-            signals_data=pd.DataFrame(combined_signal['equal_weight']),
+            signal_data=pd.DataFrame(combined_signal['equal_weight']),
             vol_target_com=vol_target_com,
             signals_z_cap=signals_z_cap)
 
@@ -200,6 +200,7 @@ class Strategy(object):
         output.positions = optim_positions
         output.optim_output = optim_output
         output.signal_output = signal_output
+        output.strategy_name = self.name
 
         return output
 
@@ -213,24 +214,17 @@ class PortfolioStrategy(Strategy):
     buy or sell it based on signals
     """
 
-    _universe = None
-
-    @classmethod
-    def set_universe(cls, **kwargs):
+    def set_universe(self, **kwargs):
         # This has to be defined by the specific implementation
         raise NotImplementedError
 
-    @classmethod
-    def get_universe(cls, **kwargs):
-        return cls._universe
+    def get_universe(self, **kwargs):
+        return self._universe
 
-    @classmethod
-    def backtest_signals(cls, **kwargs):
+    def backtest_signals(self, **kwargs):
         x=1
 
-
-    @classmethod
-    def compute_signal_quantile_performance(cls, **kwargs):
+    def compute_signal_quantile_performance(self, **kwargs):
         """
         This is a highly idealized notion of signal performance involving
         mid-market daily trading... arguably very subject to data noise
@@ -440,7 +434,7 @@ class PortfolioOptimizer(object):
 
     @staticmethod
     def compute_signal_portfolio_sensitivity(strategy=None,
-                                             signals_data=None,
+                                             signal_data=None,
                                              weights=None,
                                              num_sims=1000,
                                              sigma=2.0,
@@ -451,16 +445,16 @@ class PortfolioOptimizer(object):
         perf_pctiles = [0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99]
 
         randoms = np.random.randn(num_sims, len(weights)) * sigma / len(weights)
-        randoms = pd.DataFrame(data=randoms, columns=signals_data.columns)
+        randoms = pd.DataFrame(data=randoms, columns=signal_data.columns)
 
-        sim_perf = pd.DataFrame(index=signals_data.index,
+        sim_perf = pd.DataFrame(index=signal_data.index,
                                 columns=range(0, num_sims))
 
-        signal_z = pd.DataFrame(index=signals_data.index,
-                                columns=signals_data.columns)
+        signal_z = pd.DataFrame(index=signal_data.index,
+                                columns=signal_data.columns)
         for signal in weights.index:
             signal_z[signal] = strategy.compute_signal_z(
-                signals_data=signals_data[signal],
+                signal_data=signal_data[signal],
                 signals_z_cap=signals_z_cap)
 
         for s in range(0, num_sims):
@@ -472,7 +466,7 @@ class PortfolioOptimizer(object):
             sim_weights[sim_weights < 0.0] = 0.0
             sim_weights /= sim_weights.sum()
 
-            sim_signal = pd.DataFrame(index=signals_data.index,
+            sim_signal = pd.DataFrame(index=signal_data.index,
                                       columns=['x'])
             sim_signal['x'] = 0.0
 
@@ -482,14 +476,14 @@ class PortfolioOptimizer(object):
             # Combined pnl
             sim_perf[s], pos = strategy.backtest_signals(
                 holding_period_days=holding_period_days,
-                signals_data=pd.DataFrame(sim_signal['x']),
+                signal_data=pd.DataFrame(sim_signal['x']),
                 vol_target_com=vol_target_com,
                 signals_z_cap=signals_z_cap)
 
         sim_perf_total = sim_perf.sum(axis=0).sort_values()
         sim_perf = sim_perf[sim_perf_total.index]
 
-        sim_perf_percentiles = pd.DataFrame(index=signals_data.index,
+        sim_perf_percentiles = pd.DataFrame(index=signal_data.index,
                                             columns=perf_pctiles)
         for pctile in perf_pctiles:
             sim_perf_percentiles[pctile] = \

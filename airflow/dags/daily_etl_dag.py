@@ -13,7 +13,7 @@ default_args = {
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 3,
-    'retry_delay': timedelta(minutes=5),
+    'retry_delay': timedelta(hours=1),
     # 'queue': 'bash_queue',
     # 'pool': 'backfill',
     # 'priority_weight': 10,
@@ -70,10 +70,10 @@ night_task_waiter = TimeSensor(task_id='night_task_2000_waiter',
 
 run_this_last = DummyOperator(task_id='run_this_last', dag=dag)
 
-t1.set_upstream(night_task_waiter)
+# t1.set_upstream(night_task_waiter)
 t2.set_upstream(t1)
-t3.set_upstream(night_task_waiter)
-t5.set_upstream(night_task_waiter)
+# t3.set_upstream(night_task_waiter)
+# t5.set_upstream(night_task_waiter)
 t2.set_upstream(t7)
 
 run_this_last.set_upstream(t1)

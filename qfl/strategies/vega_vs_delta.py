@@ -12,95 +12,101 @@ from qfl.strategies.strategies import Strategy, PortfolioOptimizer
 
 class VegaVsDeltaStrategy(Strategy):
 
-    @classmethod
-    def initialize_data(cls, **kwargs):
+    def __init__(self):
+
+        Strategy.__init__(self, 'VegaVsDelta')
+
+        self.strat_data = dict()
+        self.calc = dict()
+        self.settings = dict()
 
         # Beginning of semi-clean VIX futures data
-        cls.settings.default_start_date = dt.datetime(2007, 3, 26)
-        cls.settings.fd = 21
+        self.settings.default_start_date = dt.datetime(2007, 3, 26)
 
-        cls.settings.start_date = kwargs.get('start_date',
-                                             cls.settings.default_start_date)
-        cls.settings.vol_fut_series = kwargs.get('vol_futures_series',
-                                                 'VX')
-        cls.settings.index_fut_series = kwargs.get('index_futures_series',
-                                                   'ES')
-        cls.settings.vol_fut_ticker = cls.settings.vol_fut_series + '1'
-        cls.settings.index_fut_ticker = cls.settings.index_fut_series + '1'
+    def initialize_data(self, **kwargs):
+
+        # One month constant maturity
+        self.settings.fd = 21
+
+        # Settings
+        self.settings.start_date = kwargs.get('start_date',
+                                              self.settings.default_start_date)
+        self.settings.vol_fut_series = kwargs.get('vol_futures_series', 'VX')
+        self.settings.index_fut_series = kwargs.get('index_futures_series', 'ES')
+        self.settings.vol_fut_ticker = self.settings.vol_fut_series + '1'
+        self.settings.index_fut_ticker = self.settings.index_fut_series + '1'
 
         # Constant maturity prices
-        cls.data.cm_vol_fut_prices = \
+        self.strat_data.cm_vol_fut_prices = \
             md.get_constant_maturity_futures_prices_by_series(
-                futures_series=cls.settings.vol_fut_series,
-                start_date=cls.settings.start_date)['price'] \
+                futures_series=self.settings.vol_fut_series,
+                start_date=self.settings.start_date)['price'] \
                 .unstack('days_to_maturity')\
                 .reset_index(level='series', drop=True)
 
-        # Rolling returns
-
-        cls.data.vol_fut_returns = md.get_rolling_futures_returns_by_series(
-            futures_series=cls.settings.vol_fut_series,
-            start_date=cls.settings.start_date,
+        # Rolling VIX futures returns
+        self.strat_data.vol_fut_returns = md.get_rolling_futures_returns_by_series(
+            futures_series=self.settings.vol_fut_series,
+            start_date=self.settings.start_date,
             level_change=True
         )
 
-        cls.data.index_fut_returns = md.get_rolling_futures_returns_by_series(
-            futures_series=cls.settings.index_fut_series,
-            start_date=cls.settings.start_date,
+        # Rolling index futures returns
+        self.strat_data.index_fut_returns = md.get_rolling_futures_returns_by_series(
+            futures_series=self.settings.index_fut_series,
+            start_date=self.settings.start_date,
             level_change=False
         )
 
         # Positioning
-
         vol_spec_pos = \
             md.get_cftc_positioning_by_series(
-                futures_series=cls.settings.vol_fut_series,
-                start_date=cls.settings.start_date)
+                futures_series=self.settings.vol_fut_series,
+                start_date=self.settings.start_date)
         vol_spec_pos = vol_spec_pos.set_index('date', drop=True)
-        cls.data.vol_spec_pos = vol_spec_pos['lev_money_positions_long_all'] \
-                              - vol_spec_pos['lev_money_positions_short_all']
-        cls.data.vol_fut_open_int = vol_spec_pos['open_interest_all']
+        self.strat_data.vol_spec_pos = vol_spec_pos['lev_money_positions_long_all'] \
+                                       - vol_spec_pos['lev_money_positions_short_all']
+        self.strat_data.vol_fut_open_int = vol_spec_pos['open_interest_all']
 
         index_spec_pos = \
             md.get_cftc_positioning_by_series(
-                futures_series=cls.settings.index_fut_series,
-                start_date=cls.settings.start_date)
+                futures_series=self.settings.index_fut_series,
+                start_date=self.settings.start_date)
         index_spec_pos = index_spec_pos.set_index('date', drop=True)
-        cls.data.index_spec_pos = index_spec_pos['lev_money_positions_long_all']\
-                                - index_spec_pos['lev_money_positions_short_all']
-        cls.data.index_fut_open_int = index_spec_pos['open_interest_all']
-
-    @classmethod
-    def initialize_signals(cls, **kwargs):
+        self.strat_data.index_spec_pos = index_spec_pos['lev_money_positions_long_all'] \
+                                         - index_spec_pos['lev_money_positions_short_all']
+        self.strat_data.index_fut_open_int = index_spec_pos['open_interest_all']
+    
+    def initialize_signals(self, **kwargs):
 
         holding_period_days = kwargs.get('holding_period_days', 1)
         vol_target_com = kwargs.get('vol_target_com', 63)
         signals_z_cap = kwargs.get('signals_z_cap', 1.0)
 
-        mom_signals = cls.initialize_momentum_signals()
-        ts_signals = cls.initialize_term_structure_signals()
-        pos_signals = cls.initialize_positioning_signals()
-        rv_signals = cls.initialize_rlzd_vs_implied_signals()
-        svb_signals = cls.initialize_spot_vol_beta_signals()
-        c_signals = cls.initialize_complex_signals()
+        mom_signals = self.initialize_momentum_signals()
+        ts_signals = self.initialize_term_structure_signals()
+        pos_signals = self.initialize_positioning_signals()
+        rv_signals = self.initialize_rlzd_vs_implied_signals()
+        svb_signals = self.initialize_spot_vol_beta_signals()
+        c_signals = self.initialize_complex_signals()
 
-        static_pnl = cls.compute_static_strategy()
+        static_pnl = self.compute_static_strategy()
 
-        pos_signal_pnl, pos_positions = cls.backtest_signals(
+        pos_signal_pnl, pos_positions = self.backtest_signals(
             holding_period_days=holding_period_days,
-            signals_data=pos_signals,
+            signal_data=pos_signals,
             vol_target_com=vol_target_com,
             signals_z_cap=signals_z_cap)
 
-        ts_signal_pnl, ts_positions = cls.backtest_signals(
+        ts_signal_pnl, ts_positions = self.backtest_signals(
             holding_period_days=holding_period_days,
-            signals_data=ts_signals,
+            signal_data=ts_signals,
             vol_target_com=vol_target_com,
             signals_z_cap=signals_z_cap)
 
-        rv_signal_pnl, rv_positions = cls.backtest_signals(
+        rv_signal_pnl, rv_positions = self.backtest_signals(
             holding_period_days=holding_period_days,
-            signals_data=rv_signals,
+            signal_data=rv_signals,
             vol_target_com=vol_target_com,
             signals_z_cap=signals_z_cap)
 
@@ -122,20 +128,19 @@ class VegaVsDeltaStrategy(Strategy):
         # Complete signal pnl dataset
         signal_pnl = pd.concat([pos_signal_pnl, ts_signal_pnl, rv_signal_pnl],
                                axis=1)
-        signals_data = pd.concat([pos_signals, ts_signals, rv_signals], axis=1)
-        kwargs['signals_data'] = signals_data
-        signals_data_z = cls.compute_signal_z(**kwargs)
+        signal_data = pd.concat([pos_signals, ts_signals, rv_signals], axis=1)
+        kwargs['signal_data'] = signal_data
+        signal_data_z = self.compute_signal_z(**kwargs)
 
         output = struct
-        output.signals_data_z = signals_data_z
-        output.signals_data = signals_data
+        output.signal_data_z = signal_data_z
+        output.signal_data = signal_data
         output.signal_pnl = signal_pnl
         output.static_pnl = static_pnl
 
         return output
 
-    @classmethod
-    def compute_signal_portfolio_optimization(cls,
+    def compute_signal_portfolio_optimization(self,
                                               signal_er=None,
                                               signal_cov=None,
                                               signal_corr=None,
@@ -186,8 +191,7 @@ class VegaVsDeltaStrategy(Strategy):
 
         return output
 
-    @classmethod
-    def compute_master_backtest(cls, **kwargs):
+    def compute_master_backtest(self, **kwargs):
 
         # Basic parameters
         holding_period_days = kwargs.get('holding_period_days', 1)
@@ -197,10 +201,10 @@ class VegaVsDeltaStrategy(Strategy):
         transaction_cost_per_unit = kwargs.get('transaction_cost_per_unit', 0.05)
 
         # Hedge ratios
-        cls.compute_hedge_ratios(rolling_com=rolling_beta_com)
+        self.compute_hedge_ratios(rolling_com=rolling_beta_com)
 
         # Signals data and PNL
-        signal_output = cls.initialize_signals(**kwargs)
+        signal_output = self.initialize_signals(**kwargs)
 
         signal_er = signal_output.signal_pnl.mean() \
                     * constants.trading_days_per_year
@@ -211,7 +215,7 @@ class VegaVsDeltaStrategy(Strategy):
         signal_corr = signal_output.signal_pnl.corr()
 
         # Optimization
-        optim_output = cls.compute_signal_portfolio_optimization(
+        optim_output = self.compute_signal_portfolio_optimization(
             signal_er=signal_er,
             signal_corr=signal_corr,
             signal_cov=signal_cov,
@@ -223,8 +227,8 @@ class VegaVsDeltaStrategy(Strategy):
         combined_signal[['optim_weight', 'equal_weight']] = 0.0
 
         for signal in optim_output.weights.index:
-            sz = cls.compute_signal_z(
-                signals_data=signal_output.signals_data[signal],
+            sz = self.compute_signal_z(
+                signal_data=signal_output.signal_data[signal],
                 signals_z_cap=signals_z_cap)
             combined_signal['optim_weight'] += optim_output.weights \
                 .loc[signal].values[0] * sz
@@ -235,15 +239,15 @@ class VegaVsDeltaStrategy(Strategy):
         combined_pnl = pd.DataFrame(index=signal_output.signal_pnl.index,
                                     columns=['optim_weight', 'equal_weight'])
 
-        combined_pnl['optim_weight'], optim_positions = cls.backtest_signals(
+        combined_pnl['optim_weight'], optim_positions = self.backtest_signals(
             holding_period_days=holding_period_days,
-            signals_data=pd.DataFrame(combined_signal['optim_weight']),
+            signal_data=pd.DataFrame(combined_signal['optim_weight']),
             vol_target_com=vol_target_com,
             signals_z_cap=signals_z_cap)
 
-        combined_pnl['equal_weight'], ew_positions = cls.backtest_signals(
+        combined_pnl['equal_weight'], ew_positions = self.backtest_signals(
             holding_period_days=holding_period_days,
-            signals_data=pd.DataFrame(combined_signal['equal_weight']),
+            signal_data=pd.DataFrame(combined_signal['equal_weight']),
             vol_target_com=vol_target_com,
             signals_z_cap=signals_z_cap)
 
@@ -264,77 +268,74 @@ class VegaVsDeltaStrategy(Strategy):
 
         return output
 
-    @classmethod
-    def compute_signal_z(cls, **kwargs):
+    def compute_signal_z(self, **kwargs):
 
-        signals_data = kwargs.get('signals_data', None)
+        signal_data = kwargs.get('signal_data', None)
         expanding = kwargs.get('expanding', True)
         signals_z_cap = kwargs.get('signals_z_cap', 2.0)
         if not expanding:
             com = kwargs.get('window', 252)
 
         if expanding:
-            signals_data_z = (signals_data
-                            - signals_data.expanding().mean()) \
-                            / signals_data.expanding().std()
+            signal_data_z = (signal_data
+                            - signal_data.expanding().mean()) \
+                            / signal_data.expanding().std()
         else:
-            signals_data_z = (signals_data
-                             - signals_data.ewm(com=com).mean()) \
-                            / signals_data.ewm(com=com).std()
+            signal_data_z = (signal_data
+                             - signal_data.ewm(com=com).mean()) \
+                            / signal_data.ewm(com=com).std()
 
-        signals_data_z = signals_data_z.clip(lower=-signals_z_cap,
+        signal_data_z = signal_data_z.clip(lower=-signals_z_cap,
                                              upper=signals_z_cap)
 
-        return signals_data_z
+        return signal_data_z
 
-    @classmethod
-    def initialize_rlzd_vs_implied_signals(cls, **kwargs):
+    def initialize_rlzd_vs_implied_signals(self, **kwargs):
 
-        fd = cls.settings.fd
+        fd = self.settings.fd
 
-        dates = cls.data.index_fut_returns.index
-        signals_data = pd.DataFrame(index=dates)
+        dates = self.strat_data.index_fut_returns.index
+        signal_data = pd.DataFrame(index=dates)
 
         windows = kwargs.get('windows', [10, 21, 42, 63])
         ann_factor = np.sqrt(constants.trading_days_per_year)
 
         for window in windows:
-            signals_data['rv_'+str(window)] = 100.0 * ann_factor * \
-                cls.data.index_fut_returns[
-                cls.settings.index_fut_ticker].ewm(com=window).std()\
-                - cls.data.cm_vol_fut_prices[fd]
+            signal_data['rv_'+str(window)] = 100.0 * ann_factor * \
+                self.strat_data.index_fut_returns[
+                self.settings.index_fut_ticker].ewm(com=window).std()\
+                - self.strat_data.cm_vol_fut_prices[fd]
 
-        kwargs['signals_data'] = signals_data
+        kwargs['signal_data'] = signal_data
 
-        return signals_data
+        return signal_data
 
-    @classmethod
-    def initialize_complex_signals(cls, **kwargs):
+    def initialize_complex_signals(self, **kwargs):
 
-        fd = cls.settings.fd
+        fd = self.settings.fd
         sd = 0
 
         windows = kwargs.get('windows', [1, 5, 10])
         expanding = kwargs.get('expanding', True)
         reg_window = kwargs.get('reg_window', 512)
 
-        dates = cls.data.index_fut_returns.index
-        signals_data = pd.DataFrame(index=dates)
+        dates = self.strat_data.index_fut_returns.index
+        signal_data = pd.DataFrame(index=dates)
 
         # Term structure slope
-        ts_slope = (cls.data.cm_vol_fut_prices[fd] - cls.data.cm_vol_fut_prices[
-            sd]) / cls.data.cm_vol_fut_prices[fd]
+        ts_slope = (self.strat_data.cm_vol_fut_prices[fd] - self.strat_data.cm_vol_fut_prices[
+            sd]) / self.strat_data.cm_vol_fut_prices[fd]
 
         ann_factor = np.sqrt(constants.trading_days_per_year)
-        rv = 100.0 * ann_factor * cls.data.index_fut_returns[
-            cls.settings.index_fut_ticker].ewm(com=21).std()
+        rv = 100.0 * ann_factor * self.strat_data.index_fut_returns[
+            self.settings.index_fut_ticker].ewm(com=21).std()
 
         x = pd.DataFrame(index=dates)
-        x['ivol'] = cls.data.cm_vol_fut_prices[fd]
-        x['ivol_change'] = cls.data.cm_vol_fut_prices[fd].diff(
+        x['ivol'] = self.strat_data.cm_vol_fut_prices[fd]
+        x['ivol_change'] = self.strat_data.cm_vol_fut_prices[fd].diff(
             1).ewm(com=5).mean()
-        x['returns'] = cls.data.index_fut_returns[
-            cls.settings.index_fut_ticker].ewm(com=5).mean()
+        x['returns'] = self.strat_data.index_fut_returns[
+            self.settings.index_fut_ticker].ewm(com=5).mean()
         x['rlzd_implied'] = rv - x['ivol']
         x = x[np.isfinite(x).all(axis=1)]
 
@@ -344,124 +345,119 @@ class VegaVsDeltaStrategy(Strategy):
             rolling_reg = pd.ols(y=ts_slope, x=x, window=reg_window)
 
         for window in windows:
-            signals_data['c_'+str(window)] = rolling_reg.resid.ewm(com=window).mean()
+            signal_data['c_'+str(window)] = rolling_reg.resid.ewm(com=window).mean()
 
-        kwargs['signals_data'] = signals_data
+        kwargs['signal_data'] = signal_data
 
-        return signals_data
-
-    @classmethod
-    def initialize_spot_vol_beta_signals(cls, **kwargs):
+        return signal_data
+    
+    def initialize_spot_vol_beta_signals(self, **kwargs):
 
         windows = kwargs.get('windows', [10, 21, 42, 63])
 
-        dates = cls.data.index_fut_returns.index
-        signals_data = pd.DataFrame(index=dates)
+        dates = self.strat_data.index_fut_returns.index
+        signal_data = pd.DataFrame(index=dates)
 
-        y = cls.data.cm_vol_fut_prices[cls.settings.fd].diff(1)
-        x = cls.data.index_fut_returns[cls.settings.index_fut_ticker]
+        y = self.strat_data.cm_vol_fut_prices[self.settings.fd].diff(1)
+        x = self.strat_data.index_fut_returns[self.settings.index_fut_ticker]
 
         for window in windows:
-            signals_data['svb_'+str(window)] = \
+            signal_data['svb_'+str(window)] = \
                 y.ewm(com=window).cov(x.ewm(com=window)) \
                 / x.ewm(com=window).var()
 
-        kwargs['signals_data'] = signals_data
+        kwargs['signal_data'] = signal_data
 
-        return signals_data
+        return signal_data
+    
+    def initialize_positioning_signals(self, **kwargs):
 
-    @classmethod
-    def initialize_positioning_signals(cls, **kwargs):
-
-        dates = cls.data.index_fut_returns.index
-        signals_data = pd.DataFrame(index=dates)
+        dates = self.strat_data.index_fut_returns.index
+        signal_data = pd.DataFrame(index=dates)
         com = kwargs.get('com', 252)
 
-        signals_data['vol_spec_pos'] = cls.data.vol_spec_pos \
-                                     / cls.data.vol_fut_open_int\
+        signal_data['vol_spec_pos'] = self.strat_data.vol_spec_pos \
+                                     / self.strat_data.vol_fut_open_int\
                                      .ewm(com=com).mean()
-        signals_data['index_spec_pos'] = cls.data.index_spec_pos\
-                                       / cls.data.index_fut_open_int\
+        signal_data['index_spec_pos'] = self.strat_data.index_spec_pos\
+                                       / self.strat_data.index_fut_open_int\
                                        .ewm(com=com).mean()
 
         # Note: these data don't come out until t + x?
         offset = 3
-        signals_data = signals_data.shift(offset)
+        signal_data = signal_data.shift(offset)
 
         # Fill to daily
-        signals_data = signals_data.fillna(method='ffill')
+        signal_data = signal_data.fillna(method='ffill')
 
         # Change signals
-        signals_data['vol_spec_pos_chg_s'] = signals_data['vol_spec_pos']\
+        signal_data['vol_spec_pos_chg_s'] = signal_data['vol_spec_pos']\
             .diff(1).ewm(com=21).mean()
-        signals_data['index_spec_pos_chg_s'] = signals_data['index_spec_pos'] \
+        signal_data['index_spec_pos_chg_s'] = signal_data['index_spec_pos'] \
             .diff(1).ewm(com=21).mean()
 
-        signals_data['vol_spec_pos_chg_l'] = signals_data['vol_spec_pos']\
+        signal_data['vol_spec_pos_chg_l'] = signal_data['vol_spec_pos']\
             .diff(1).ewm(com=63).mean()
-        signals_data['index_spec_pos_chg_l'] = signals_data['index_spec_pos'] \
+        signal_data['index_spec_pos_chg_l'] = signal_data['index_spec_pos'] \
             .diff(1).ewm(com=63).mean()
 
-        kwargs['signals_data'] = signals_data
+        kwargs['signal_data'] = signal_data
 
-        return signals_data
+        return signal_data
+    
+    def initialize_term_structure_signals(self, **kwargs):
 
-    @classmethod
-    def initialize_term_structure_signals(cls, **kwargs):
-
-        fd = cls.settings.fd
+        fd = self.settings.fd
         sd = 0
 
         # Looking at how long to smooth term structure
         windows = kwargs.get('windows', [0, 1, 5, 10])
 
-        dates = cls.data.index_fut_returns.index
-        signals_data = pd.DataFrame(index=dates)
+        dates = self.strat_data.index_fut_returns.index
+        signal_data = pd.DataFrame(index=dates)
 
-        ts_slope = (cls.data.cm_vol_fut_prices[fd]
-            - cls.data.cm_vol_fut_prices[sd]) / \
-            cls.data.cm_vol_fut_prices[fd]
+        ts_slope = (self.strat_data.cm_vol_fut_prices[fd]
+                    - self.strat_data.cm_vol_fut_prices[sd]) / \
+                   self.strat_data.cm_vol_fut_prices[fd]
 
         for window in windows:
-            signals_data['ts_'+str(window)] = ts_slope.ewm(com=window).mean()
+            signal_data['ts_'+str(window)] = ts_slope.ewm(com=window).mean()
 
-        kwargs['signals_data'] = signals_data
+        kwargs['signal_data'] = signal_data
 
-        return signals_data
+        return signal_data
 
-    @classmethod
-    def initialize_momentum_signals(cls, **kwargs):
+    def initialize_momentum_signals(self, **kwargs):
 
         # Studying impact of various time windows for prior performance
         windows = kwargs.get('windows', [1, 5, 10, 21])
 
         # Get the static backtest data just to be sure
-        backtest_data = cls.compute_static_strategy(**kwargs)
+        backtest_data = self.compute_static_strategy(**kwargs)
 
-        dates = cls.data.index_fut_returns.index
-        signals_data = pd.DataFrame(index=dates)
+        dates = self.strat_data.index_fut_returns.index
+        signal_data = pd.DataFrame(index=dates)
         for window in windows:
-            signals_data['mom_'+str(window)] = backtest_data['static_pnl'] \
+            signal_data['mom_'+str(window)] = backtest_data['static_pnl'] \
                 .ewm(com=window).mean()
 
-        kwargs['signals_data'] = signals_data
+        kwargs['signal_data'] = signal_data
 
-        return signals_data
+        return signal_data
 
-    @classmethod
-    def compute_hedge_ratios(cls, **kwargs):
+    def compute_hedge_ratios(self, **kwargs):
 
-        fd = cls.settings.fd
+        fd = self.settings.fd
         rolling_beta_com = kwargs.get('rolling_beta_com', 21)
 
         # Trailing betas
-        y = cls.data.cm_vol_fut_prices[fd].diff(1)
+        y = self.strat_data.cm_vol_fut_prices[fd].diff(1)
 
         # Predict volatility move as a function of stuff
-        x = pd.DataFrame(index=cls.data.index_fut_returns.index)
-        x['index_return'] = cls.data.index_fut_returns[
-            cls.settings.index_fut_ticker]
-        x['vol_level'] = cls.data.cm_vol_fut_prices[fd].shift(1)
+        x = pd.DataFrame(index=self.strat_data.index_fut_returns.index)
+        x['index_return'] = self.strat_data.index_fut_returns[
+            self.settings.index_fut_ticker]
+        x['vol_level'] = self.strat_data.cm_vol_fut_prices[fd].shift(1)
         x['interaction'] = x['index_return'] * x['vol_level']
         exog_vars = ['index_return', 'vol_level', 'interaction']
 
@@ -489,50 +485,48 @@ class VegaVsDeltaStrategy(Strategy):
                                    vol_level_grid[i] * r3.params.interaction)
 
         # Historical spot-vol betas (vol points per 1%)
-        cls.calc.spot_vol_beta = (r3.params.index_return
+        self.calc.spot_vol_beta = (r3.params.index_return
                                   + x['vol_level']
                                   * r3.params.interaction) / 100.0
 
-        cls.calc.rolling_spot_vol_beta = \
+        self.calc.rolling_spot_vol_beta = \
             y.ewm(com=rolling_beta_com).cov(x['index_return']
                 .ewm(com=rolling_beta_com)) \
             / x['index_return'].ewm(com=rolling_beta_com).var()
 
-    @classmethod
-    def compute_static_strategy(cls, **kwargs):
+    def compute_static_strategy(self, **kwargs):
 
         # Vega-vs-delta (short vol, short stocks)
-        cls.calc.backtest_data \
-            = pd.DataFrame(index=cls.data.index_fut_returns.index)
+        self.calc.backtest_data \
+            = pd.DataFrame(index=self.strat_data.index_fut_returns.index)
 
-        cls.calc.backtest_data['vega'] \
-            = cls.data.vol_fut_returns[cls.settings.vol_fut_ticker]
+        self.calc.backtest_data['vega'] \
+            = self.strat_data.vol_fut_returns[self.settings.vol_fut_ticker]
 
-        cls.calc.backtest_data['delta'] \
-            = cls.data.index_fut_returns[cls.settings.index_fut_ticker]\
-            * 100.0 * cls.calc.spot_vol_beta
+        self.calc.backtest_data['delta'] \
+            = self.strat_data.index_fut_returns[self.settings.index_fut_ticker]\
+            * 100.0 * self.calc.spot_vol_beta
 
-        cls.calc.backtest_data['static_pnl'] \
-            = cls.calc.backtest_data['delta']\
-            - cls.calc.backtest_data['vega']
+        self.calc.backtest_data['static_pnl'] \
+            = self.calc.backtest_data['delta']\
+            - self.calc.backtest_data['vega']
 
-        return cls.calc.backtest_data
+        return self.calc.backtest_data
 
-    @classmethod
-    def backtest_signals(cls, **kwargs):
+    def backtest_signals(self, **kwargs):
 
-        dates = cls.data.index_fut_returns.index
+        dates = self.strat_data.index_fut_returns.index
         holding_period_days = kwargs.get('holding_period_days', 1)
         vol_target_com = kwargs.get('vol_target_com', None)
 
-        signals_data_z = cls.compute_signal_z(**kwargs)
+        signal_data_z = self.compute_signal_z(**kwargs)
 
-        backtest_signals = signals_data_z.columns
+        backtest_signals = signal_data_z.columns
         signal_pnl = pd.DataFrame(index=dates,
                                   columns=backtest_signals)
 
-        positions = signals_data_z.shift(holding_period_days)
-        backtest_data = cls.compute_static_strategy(**kwargs)
+        positions = signal_data_z.shift(holding_period_days)
+        backtest_data = self.compute_static_strategy(**kwargs)
 
         # Volatility target the whole strategy vs the static backtest
         if vol_target_com is not None:

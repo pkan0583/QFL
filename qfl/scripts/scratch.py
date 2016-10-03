@@ -36,6 +36,56 @@ from qfl.models.volatility_factor_model import VolatilityFactorModel
 
 db.initialize()
 
+'''
+--------------------------------------------------------------------------------
+Process to clean implied volatility
+Process to create skew and curve by moneyness
+--------------------------------------------------------------------------------
+'''
+
+reload(md)
+from qfl.core.market_data import VolatilitySurfaceManager
+
+start_date = dt.datetime(2010, 1, 1)
+end_date = dt.datetime.today()
+vsm = VolatilitySurfaceManager()
+tickers = md.get_etf_vol_universe()
+vsm.load_data(tickers=tickers)
+
+date = dt.datetime(2011, 8, 17)
+
+delta_grid = np.append([0.001, 0.01],
+                       np.append(np.arange(0.05, 1.0, 0.05),
+                                 [0.99, 0.999]))
+moneyness_grid = np.arange(0.20, 2.0, 0.05)
+
+# CONSTANT MATURITY
+
+data = vsm.get_surface_point_by_delta(tickers=['SPY'],
+                                      call_delta=delta_grid,
+                                      tenor_in_days=21,
+                                      start_date=start_date,
+                                      end_date=end_date)
+
+m = calcs.black_scholes_moneyness_from_delta(call_delta=delta_grid,
+                                             tenor_in_days=21,
+                                             ivol=data/100.0,
+                                             risk_free=0,
+                                             div_yield=0)
+
+strikes = [175, 190, 200, 205, 210]
+tmp = vsm.get_fixed_maturity_vol_by_strike(
+    ticker='SPY',
+    strikes=strikes,
+    contract_month_number=1,
+    start_date=date
+)
+
+
+
+
+
+
 
 '''
 --------------------------------------------------------------------------------
