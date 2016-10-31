@@ -10,7 +10,7 @@ import pymc
 import matplotlib.pyplot as plt
 import qfl.utilities.basic_utilities as utils
 import qfl.core.constants as constants
-
+from qfl.utilities.bayesian_modeling import BayesianTimeSeriesDataCleaner
 
 def windsorize(df=None, z=2.0):
 
@@ -142,6 +142,12 @@ def compute_constant_maturity_futures_prices(generic_futures_data=None,
     generic_futures_prices = generic_futures_data[price_field].unstack('ticker')
     futures_ttm = generic_futures_data['days_to_maturity'].unstack('ticker')
 
+    for col in generic_futures_prices.columns:
+        generic_futures_prices[col] = pd.to_numeric(generic_futures_prices[col])
+
+    for col in futures_ttm.columns:
+        futures_ttm[col] = pd.to_numeric(futures_ttm[col])
+
     if spot_prices is not None:
 
         orig_cols = generic_futures_prices.columns.tolist()
@@ -161,7 +167,8 @@ def compute_constant_maturity_futures_prices(generic_futures_data=None,
         date = dates[t]
 
         ind = (np.isfinite(futures_ttm.loc[date])) \
-                  & (np.isfinite(generic_futures_prices.loc[date]))
+                  & (np.isfinite(generic_futures_prices.loc[date])
+                  & futures_ttm.loc[date] >= 0.0)
 
         interp_values = generic_futures_prices.loc[date][ind]
 
@@ -180,6 +187,9 @@ def compute_constant_maturity_futures_prices(generic_futures_data=None,
         except:
             x=1
 
+    constant_maturity_futures_prices[
+        constant_maturity_futures_prices < 0] = np.nan
+
     if volatilities:
         constant_maturity_futures_prices **= 0.5
 
@@ -190,21 +200,22 @@ def clean_implied_vol_data(tickers=None,
                            stock_prices=None,
                            ivol=None,
                            ref_ivol_ticker=None,
-                           res_com=5,
-                           deg_f=4,
-                           buffer_days=3,
-                           pct_threshold=0.0001,
                            calendar_name='UnitedStates'):
 
     orig_ivol = ivol.copy(deep=True)
     ivol = ivol.copy(deep=True)
-    stock_prices = stock_prices.copy(deep=True)
+    # stock_returns = stock_prices.diff(1) / stock_prices.shift(1)
+
+    # Data should come in unstacked (tickers in columns)
+    if len(ivol.index.names) > 1:
+        ivol = ivol.unstack('ticker')
 
     if isinstance(ivol, pd.DataFrame):
         clean_ivol = pd.DataFrame(index=ivol.index, columns=ivol.columns)
     elif isinstance(ivol, pd.Series):
         clean_ivol = pd.DataFrame(index=ivol.index, columns=tickers)
-    normal_tests = pd.DataFrame(index=tickers, columns=['stat'])
+    # normal_tests = pd.DataFrame(index=tickers, columns=['stat'])
+    prob_dirty = pd.DataFrame(index=ivol.index, columns=clean_ivol.index)
 
     for ticker in tickers:
 
@@ -212,41 +223,30 @@ def clean_implied_vol_data(tickers=None,
 
         try:
 
-            riv = ivol[ref_ivol_ticker]
-            if ref_ivol_ticker == ticker:
-                riv = None
+            z_t = pd.DataFrame(index=ivol.index)
+            # z_t['r'] = stock_returns[ticker]
+            if ref_ivol_ticker != ticker:
+                z_t['rv'] = ivol[ref_ivol_ticker]
+            # else:
+                # z_t['r'] = stock_returns[ticker]
 
-            clean_ivol_tmp, tmp_pr, r1 = _clean_implied_vol_data_one(
-                stock_prices=stock_prices[ticker],
-                ivol=ivol[ticker],
-                ref_ivol=riv,
-                pct_threshold=pct_threshold,
-                buffer_days=buffer_days,
-                res_com=res_com,
-                deg_f=deg_f,
-                calendar_name=calendar_name)
+            df = BayesianTimeSeriesDataCleaner.clean_data(x=ivol[ticker],
+                                                          z=z_t,
+                                                          diff_type='level')
 
-            clean_ivol_tmp = clean_ivol_tmp[np.isfinite(clean_ivol_tmp)]
-
-            clean_ivol[ticker], tmp_pr_, r1_ = _clean_implied_vol_data_one(
-                stock_prices=stock_prices[ticker],
-                ivol=clean_ivol_tmp,
-                ref_ivol=riv,
-                pct_threshold=pct_threshold,
-                buffer_days=buffer_days,
-                res_com=res_com,
-                deg_f=deg_f,
-                calendar_name=calendar_name)
-
-            normal_tests.loc[ticker, 'stat'] = normaltest(r1.resid).statistic
+            clean_ivol[ticker] = df['x_clean']
+            prob_dirty[ticker] = df['state_probs']
+            # normal_tests.loc[ticker, 'stat'] = normaltest(r1.resid).statistic
 
         except:
             print('failed!')
 
+    if len(orig_ivol.index.names) > 1:
+        clean_ivol = clean_ivol.stack('ticker')
     orig_ivol.loc[clean_ivol.index] = clean_ivol.values
     clean_ivol = orig_ivol
 
-    return clean_ivol, normal_tests
+    return clean_ivol, prob_dirty # , normal_tests
 
 
 def _clean_implied_vol_data_one(stock_prices=None,
@@ -449,30 +449,113 @@ Volatility swaps
 '''
 
 
+def _handle_dividend(div=0.0,
+                     div_type='yield',
+                     risk_free=0.0,
+                     spot=None,
+                     tenor_in_days=None):
+    eps = 1e-7
+    t = utils.numeric_cap_floor(
+        x=tenor_in_days / constants.trading_days_per_year,
+        floor=eps)
+
+    if div_type == 'yield':
+        pv_div = (1.0 - np.exp(-risk_free * t)) / (eps + risk_free) * div * t
+    elif div_type == 'amount':
+        pv_div = np.exp(-t * risk_free) * div
+    else:
+        pv_div = 0.0
+    adj_spot = spot - pv_div
+
+    return pv_div, adj_spot
+
+
+def option_at_expiration(spot=None,
+                         strike=None,
+                         tenor_in_days=None,
+                         risk_free=None,
+                         ivol=None,
+                         div=0.0,
+                         div_type='yield',
+                         d1=None,
+                         option_type='c'):
+
+    if isinstance(option_type, pd.Series):
+
+        price = pd.Series(index=option_type.index)
+        option_type = option_type.str.upper()
+
+        call_ind = option_type.index[option_type.isin(['C', 'CALL'])]
+        price.loc[call_ind] = np.max(0, spot.loc[call_ind] - strike.loc[call_ind])
+
+        put_ind = option_type.index[option_type.isin(['P', 'PUT'])]
+        price.loc[put_ind] = np.max(0, strike.loc[put_ind] - spot.loc[put_ind])
+
+    else:
+        if option_type.upper() in (['C', 'CALL']):
+            price = np.max(0, spot - strike)
+        elif option_type.upper() in (['P', 'PUT']):
+            price = np.max(0, strike - spot)
+
+    return price
+
+
 def black_scholes_price(spot=None,
                         strike=None,
                         tenor_in_days=None,
                         risk_free=None,
                         ivol=None,
-                        div_amt=None,
+                        div=0.0,
+                        div_type='yield',
                         d1=None,
                         option_type='c'):
 
-    t = tenor_in_days / constants.trading_days_per_year
-    pv_div = np.exp(-t * risk_free) * div_amt
-    adj_spot = spot - pv_div
+    eps = 1e-7
+    t = utils.numeric_cap_floor(
+        x=tenor_in_days / constants.trading_days_per_year,
+        floor=eps)
+    pv_div, adj_spot = _handle_dividend(div=div,
+                                        div_type=div_type,
+                                        risk_free=risk_free,
+                                        spot=spot,
+                                        tenor_in_days=tenor_in_days)
 
     if d1 is None:
-        d1 = (np.log(adj_spot / strike) + (risk_free + ivol ** 2.0 / 2.0) * t)\
-             / (ivol * t ** 0.5)
-    d2 = d1 - ivol * t ** 0.5
+        d1, d2 = black_scholes_d1(spot=spot,
+                                  strike=strike,
+                                  tenor_in_days=tenor_in_days,
+                                  risk_free=risk_free,
+                                  ivol=ivol,
+                                  div=div,
+                                  div_type=div_type)
 
-    if option_type.upper() in (['C', 'CALL']):
-        price = adj_spot * norm.cdf(d1) \
-                - np.exp(-risk_free * t) * strike * norm.cdf(d2)
-    elif option_type.upper() in (['P', 'PUT']):
-        price = strike * np.exp(-risk_free * t) * norm.cdf(-d2) \
-                - spot * norm.cdf(-d1)
+    if isinstance(option_type, pd.Series):
+
+        price = pd.Series(index=option_type.index)
+        option_type = option_type.str.upper()
+
+        d1 = pd.to_numeric(d1)
+        d2 = pd.to_numeric(d2)
+
+        call_ind = option_type.index[option_type.isin(['C', 'CALL'])]
+        price.loc[call_ind] = adj_spot.loc[call_ind] \
+            * norm.cdf(d1.loc[call_ind]) \
+            - np.exp(-risk_free.loc[call_ind] * t.loc[call_ind])\
+              * strike.loc[call_ind] * norm.cdf(d2.loc[call_ind])
+
+        put_ind = option_type.index[option_type.isin(['P', 'PUT'])]
+        price.loc[put_ind] = strike.loc[put_ind] \
+            * np.exp(-risk_free.loc[put_ind]
+            * t.loc[put_ind]) * norm.cdf(-d2.loc[put_ind]) \
+            - spot.loc[put_ind] * norm.cdf(-d1.loc[put_ind])
+
+    else:
+        if option_type.upper() in (['C', 'CALL']):
+            price = adj_spot * norm.cdf(d1) \
+                    - np.exp(-risk_free * t) * strike * norm.cdf(d2)
+        elif option_type.upper() in (['P', 'PUT']):
+            price = strike * np.exp(-risk_free * t) * norm.cdf(-d2) \
+                    - spot * norm.cdf(-d1)
 
     return price
 
@@ -481,12 +564,20 @@ def put_call_parity(input_price=None,
                     option_type='c',
                     spot=None,
                     strike=None,
-                    div_amt=None,
+                    div=0.0,
+                    div_type='yield',
                     risk_free=None,
                     tenor_in_days=None):
 
-    t = tenor_in_days / constants.trading_days_per_year
-    pv_div = np.exp(-t * risk_free) * div_amt
+    eps = 1e-7
+    t = utils.numeric_cap_floor(
+        x=tenor_in_days / constants.trading_days_per_year,
+        floor=eps)
+    pv_div, adj_spot = _handle_dividend(div=div,
+                                        div_type=div_type,
+                                        risk_free=risk_free,
+                                        spot=spot,
+                                        tenor_in_days=tenor_in_days)
 
     # cash plus call plus divs equals put plus stock
     if option_type.upper() in (['C', 'CALL']):
@@ -502,25 +593,83 @@ def black_scholes_delta(spot=None,
                         tenor_in_days=None,
                         risk_free=None,
                         ivol=None,
-                        div_amt=None,
-                        d1=None):
+                        div=0.0,
+                        div_type='yield',
+                        d1=None,
+                        option_type=None):
 
-    t = tenor_in_days / constants.trading_days_per_year
-    pv_div = np.exp(-t * risk_free) * div_amt
-    adj_spot = spot - pv_div
-    div_yield = div_amt / spot / t
+    eps = 1e-7
+    t = utils.numeric_cap_floor(
+        x=tenor_in_days / constants.trading_days_per_year,
+        floor=eps)
+    pv_div, adj_spot = _handle_dividend(div=div,
+                                        div_type=div_type,
+                                        risk_free=risk_free,
+                                        spot=spot,
+                                        tenor_in_days=tenor_in_days)
+    div_yield = pv_div / spot / t
 
     if d1 is None:
-        d1 = black_scholes_d1(spot=spot,
-                              strike=strike,
-                              tenor_in_days=tenor_in_days,
-                              risk_free=risk_free,
-                              ivol=ivol,
-                              div_amt=div_amt)
+        d1, d2 = black_scholes_d1(spot=spot,
+                                  strike=strike,
+                                  tenor_in_days=tenor_in_days,
+                                  risk_free=risk_free,
+                                  ivol=ivol,
+                                  div=div,
+                                  div_type=div_type)
 
-    delta = np.exp(-div_yield * t) * norm.cdf(d1)
+    if isinstance(option_type, pd.Series):
+
+        delta = pd.Series(index=option_type.index)
+        option_type = option_type.str.upper()
+
+        call_ind = option_type.index[option_type.isin(['C', 'CALL'])]
+        delta.loc[call_ind] = np.exp(-div_yield.loc[call_ind]
+            * t.loc[call_ind]) * norm.cdf(d1.loc[call_ind])
+
+        put_ind = option_type.index[option_type.isin(['P', 'PUT'])]
+        delta.loc[put_ind] = -np.exp(-div_yield.loc[put_ind]
+            * t.loc[put_ind]) * norm.cdf(-d1.loc[put_ind])
+
+    else:
+        if option_type.upper() in (['C', 'CALL']):
+            delta = np.exp(-div_yield * t) * norm.cdf(d1)
+        elif option_type.upper() in (['P', 'PUT']):
+            delta = -np.exp(-div_yield * t) * norm.cdf(-d1)
 
     return delta
+
+
+def black_scholes_vega(spot=None,
+                       strike=None,
+                       tenor_in_days=None,
+                       risk_free=None,
+                       ivol=None,
+                       div=0.0,
+                       div_type='yield',
+                       d1=None,
+                       option_type=None):
+
+    eps = 1e-7
+    t = utils.numeric_cap_floor(
+        x=tenor_in_days / constants.trading_days_per_year,
+        floor=eps)
+    if div_type == 'yield':
+        div_yield = div
+    elif div_type == 'amount':
+        div_yield = div / spot / t
+
+    if d1 is None:
+        d1, d2 = black_scholes_d1(spot=spot,
+                                  strike=strike,
+                                  tenor_in_days=tenor_in_days,
+                                  risk_free=risk_free,
+                                  ivol=ivol,
+                                  div=div,
+                                  div_type=div_type)
+
+    vega = spot * np.exp(-div_yield * t) * norm.pdf(d1) * np.sqrt(t) / 100.0
+    return vega
 
 
 def black_scholes_d1(spot=None,
@@ -528,14 +677,28 @@ def black_scholes_d1(spot=None,
                      tenor_in_days=None,
                      risk_free=None,
                      ivol=None,
-                     div_amt=None):
+                     div=None,
+                     div_type='yield'):
 
-    t = tenor_in_days / constants.trading_days_per_year
-    pv_div = np.exp(-t * risk_free) * div_amt
-    adj_spot = spot - pv_div
+    eps = 1e-7
+    t = utils.numeric_cap_floor(
+        x=tenor_in_days / constants.trading_days_per_year,
+        floor=eps)
+    pv_div, adj_spot = _handle_dividend(div=div,
+                                        div_type=div_type,
+                                        risk_free=risk_free,
+                                        spot=spot,
+                                        tenor_in_days=tenor_in_days)
+
     d1 = (np.log(adj_spot / strike) + (risk_free + ivol ** 2.0 / 2.0) * t) \
          / (ivol * t ** 0.5)
-    return d1
+
+    d2 = d1 - ivol * t ** 0.5
+
+    d1 = pd.to_numeric(d1)
+    d2 = pd.to_numeric(d2)
+
+    return d1, d2
 
 
 def black_scholes_moneyness_from_delta(call_delta=None,
@@ -560,7 +723,9 @@ def black_scholes_moneyness_from_delta(call_delta=None,
         call_delta = np.array(call_delta)
 
     put_delta = 1.0 - call_delta
-    t = tenor_in_days / constants.trading_days_per_year
+    eps = 1e-7
+    t = utils.numeric_cap_floor(x=tenor_in_days/constants.trading_days_per_year,
+                                floor=eps)
 
     if isinstance(tenor_in_days, pd.Series) and isinstance(ivol, pd.DataFrame):
         m = pd.DataFrame(index=ivol.index, columns=ivol.columns)

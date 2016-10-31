@@ -160,6 +160,95 @@ plt.plot(df['var_vol'])
 plt.plot(df['cap_ratio'])
 plt.plot(df['package'])
 
+
+"""
+-------------------------------------------------------------------------------
+Skew chart
+-------------------------------------------------------------------------------
+"""
+
+# Skew trade
+
+spot_px = 1.06
+call_strike = 1.07
+put_strike = 1.05
+tenor_in_days = 5
+risk_free = 0.0
+call_vol = 0.15
+put_vol = 0.16
+event_vol = 0.05
+
+call_px = calcs.black_scholes_price(spot=spot_px,
+                                    strike=call_strike,
+                                    tenor_in_days=tenor_in_days,
+                                    risk_free=risk_free,
+                                    ivol=call_vol,
+                                    div_amt=0,
+                                    option_type='c')
+
+put_px = calcs.black_scholes_price(spot=spot_px,
+                                   strike=put_strike,
+                                   tenor_in_days=tenor_in_days,
+                                   risk_free=risk_free,
+                                   ivol=put_vol,
+                                   div_amt=0,
+                                   option_type='p')
+
+hedge_ratio = call_px / put_px
+
+call_delta = calcs.black_scholes_delta(spot=spot_px,
+                                       strike=call_strike,
+                                       tenor_in_days=tenor_in_days,
+                                       risk_free=risk_free,
+                                       ivol=call_vol-event_vol,
+                                       div_amt=0,
+                                       option_type='c')
+
+put_delta = calcs.black_scholes_delta(spot=spot_px,
+                                      strike=put_strike,
+                                      tenor_in_days=tenor_in_days,
+                                      risk_free=risk_free,
+                                      ivol=put_vol-event_vol,
+                                      div_amt=0,
+                                      option_type='p')
+
+spot_grid = np.arange(1.0, 1.12, 0.005)
+cols = ['call', 'put', 'delta_hedge', 'risk_reversal']
+scenario_analysis = pd.DataFrame(index=spot_grid, columns=cols)
+
+scenario_analysis['call'] = calcs.black_scholes_price(spot=spot_grid,
+                                                      strike=call_strike,
+                                                      tenor_in_days=tenor_in_days-1,
+                                                      risk_free=risk_free,
+                                                      ivol=call_vol - event_vol,
+                                                      div_amt=0,
+                                                      option_type='c')
+
+scenario_analysis['put'] = calcs.black_scholes_price(spot=spot_grid,
+                                                     strike=put_strike,
+                                                     tenor_in_days=tenor_in_days-1,
+                                                     risk_free=risk_free,
+                                                     ivol=put_vol - event_vol,
+                                                     div_amt=0,
+                                                     option_type='p')
+
+scenario_analysis['delta_hedge'] = -(call_delta - put_delta * hedge_ratio) \
+                                   * (spot_grid - 1.06)
+
+scenario_analysis['risk_reversal'] = scenario_analysis['call'] \
+                                     - scenario_analysis['put'] * hedge_ratio \
+                                     + scenario_analysis['delta_hedge'] * 0.925
+
+fig, ax = plt.subplots()
+ax.plot(scenario_analysis['risk_reversal'] * 100.0)
+fmt = '%.2f%%'
+yticks = mtick.FormatStrFormatter(fmt)
+ax.yaxis.set_major_formatter(yticks)
+plt.ylabel('PNL, % of notional')
+plt.xlabel('EURUSD after the event')
+ax.set_xlim([1.0, 1.12])
+
+
 """
 -------------------------------------------------------------------------------
 Macro model

@@ -5,6 +5,7 @@ import datetime as dt
 
 import qfl.utilities.basic_utilities as utils
 from qfl.core.database_interface import DatabaseInterface as db
+from qfl.core.database_interface import DatabaseUtilities as dbutils
 from qfl.core.market_data import VolatilitySurfaceManager
 from qfl.strategies.strategy_master import StrategyMaster
 import qfl.core.market_data as md
@@ -14,14 +15,23 @@ db.initialize()
 logger = logging.getLogger()
 
 
-def initialize_strategy_environment():
+def initialize_strategy_environment(start_date=md.history_default_start_date,
+                                    **kwargs):
 
     # Volatility
     vsm = VolatilitySurfaceManager()
     tickers = md.get_etf_vol_universe()
-    vsm.load_data(tickers=tickers, start_date=start_date)
-    clean_data, final_tickers = vsm.clean_data(tickers=tickers)
-    vsm.data = clean_data
+
+    load_clean_data = kwargs.get('load_clean_data', False)
+    if load_clean_data:
+        clean_data = pd.read_excel('data/clean_ivol_data.xlsx')
+        clean_data['date'] = clean_data['date'].ffill()
+        clean_data = clean_data.set_index(['date', 'ticker'], drop=True)
+        vsm.data = clean_data
+    else:
+        vsm.load_data(tickers=tickers, start_date=start_date)
+        clean_data, final_tickers = vsm.clean_data(tickers=tickers)
+        vsm.data = clean_data
 
     # Strategy master
     sm = StrategyMaster()
@@ -57,7 +67,7 @@ def get_model_param_config_id(model_name=None, settings=None):
         archive_model_param_config(model_name=model_name, settings=settings)
         model_params = get_model_param_configs(model_name=model_name)
     row = model_params[model_params['model_params'] == export_settings]
-    id = row['id'][0]
+    id = row['id'].values[0]
     return id
 
 
@@ -121,8 +131,8 @@ def archive_model_output_config():
     model_id = get_model_id('vol_rv')
     df.loc[8] = [model_id, 'pnl_net']
     df.loc[9] = [model_id, 'pnl_gross']
-    df.loc[10] = [model_id, 'net_vega']
-    df.loc[11] = [model_id, 'gross_vega']
+    df.loc[10] = [model_id, 'vega_net']
+    df.loc[11] = [model_id, 'vega_gross']
 
     df['id'] = df.index.get_level_values(None)
 
@@ -171,8 +181,8 @@ def archive_model_outputs(model=None, outputs=None):
 
     # Ready to archive
     df = model.process_model_outputs(outputs)
-    df['model_param_id'] = 0
-    df['model_output_id'] = param_config_id
+    df['model_param_id'] = param_config_id
+    df['model_output_id'] = 0
     df['model_id'] = get_model_id(model.name)
 
     # Output fields for this model
@@ -198,7 +208,7 @@ def get_model_outputs(model_name=None,
 
     s = "select * from model_outputs_view "
     s += " where model_name = '{0}'".format(model_name)
-    s += ' and param_config_id = {0}'.format(param_config_id)
+    s += ' and model_param_id = {0}'.format(param_config_id)
 
     data = md._get_time_series_data(s=s,
                                     start_date=start_date,
@@ -239,8 +249,14 @@ def archive_strategy_signal_data(model=None,
                                  signal_data=None,
                                  signal_data_z=None):
 
+    signals = get_strategy_signals(model_name=model.name)
+    model_param_id = get_model_param_config_id(model_name=model.name,
+                                               settings=model.settings)
+
     df = model.process_signal_data_for_archive(signal_data=signal_data,
-                                               signal_data_z=signal_data_z)
+                                               signal_data_z=signal_data_z,
+                                               db_signals=signals,
+                                               model_param_id=model_param_id)
     table = db.get_table('model_signal_data')
     db.execute_db_save(df=df, table=table, time_series=True)
 
@@ -248,21 +264,60 @@ def archive_strategy_signal_data(model=None,
 def archive_strategy_signal_pnl(model=None,
                                 signal_pnl=None):
 
-    df = model.process_signal_pnl_for_archive(signal_pnl=signal_pnl)
+    signals = get_strategy_signals(model_name=model.name)
+    model_param_id = get_model_param_config_id(model_name=model.name,
+                                               settings=model.settings)
+
+    df = model.process_signal_pnl_for_archive(signal_pnl=signal_pnl,
+                                              db_signals=signals,
+                                              model_param_id=model_param_id)
     table = db.get_table('model_signal_data')
     db.execute_db_save(df=df, table=table, time_series=True)
 
 
 def archive_portfolio_strategy_signal_data(model=None,
                                            signal_data=None,
-                                           signal_data_z=None):
+                                           signal_data_z=None,
+                                           backtest_update_start_date=None):
 
-    df = model.process_signal_data_for_archive(
-        signal_data=signal_data,
-        signal_data_z=signal_data_z)
+    if backtest_update_start_date is not None:
+        dates = signal_data.index.get_level_values('date')
+        signal_data = signal_data[dates >= backtest_update_start_date]
+        dates = signal_data_z.index.get_level_values('date')
+        signal_data_z = signal_data_z[dates >= backtest_update_start_date]
 
-    table = db.get_table('model_signal_data')
-    db.execute_db_save(df=df, table=table, time_series=True)
+    if len(signal_data) > 0:
+
+        signals = get_strategy_signals(model_name=model.name)
+        model_param_id = get_model_param_config_id(model_name=model.name,
+                                                   settings=model.settings)
+
+        df = model.process_signal_data_for_archive(
+            signal_data=signal_data,
+            signal_data_z=signal_data_z,
+            db_signals=signals,
+            model_param_id=model_param_id)
+
+        table = db.get_table('model_signal_data')
+        db.execute_db_save(df=df, table=table, time_series=True)
+
+
+def get_portfolio_strategy_signal_pnl(model=None,
+                                      signal_names=None,
+                                      start_date=md.history_default_start_date,
+                                      end_date=dt.datetime.today()):
+
+    df = get_strategy_signal_data(model=model,
+                                  signal_names=signal_names,
+                                  ref_entity_ids=['strategy'],
+                                  start_date=start_date,
+                                  end_date=end_date)
+    df =  df[['date', 'signal_name', 'pnl']]\
+        .set_index(['date', 'signal_name'], drop=True)\
+        .unstack('signal_name')\
+        ['pnl']
+
+    return df
 
 
 def get_strategy_signal_data(model=None,
@@ -274,8 +329,6 @@ def get_strategy_signal_data(model=None,
     param_config_id = get_model_param_config_id(
         model_name=model.name, settings=model.settings)
 
-    from qfl.core.database_interface import DatabaseUtilities as dbutils
-
     if signal_names is None:
         s = "select * from model_signal_data_view "
     else:
@@ -285,7 +338,8 @@ def get_strategy_signal_data(model=None,
     s += ' and model_param_id = {0}'.format(param_config_id)
 
     if ref_entity_ids is not None:
-        s += ' and ref_entity_id in {0}'.format(tuple(ref_entity_ids))
+        s += ' and ref_entity_id in {0}'.format(
+            dbutils.format_for_query(ref_entity_ids))
 
     data = md._get_time_series_data(s=s,
                                     start_date=start_date,
@@ -294,7 +348,11 @@ def get_strategy_signal_data(model=None,
     return data
 
 
-def archive_portfolio_strategy_signal_pnl(model=None, signal_data=None, **kwargs):
+def compute_and_archive_portfolio_strategy_signal_pnl(model=None,
+                                                      signal_data=None,
+                                                      **kwargs):
+
+    backtest_update_start_date = kwargs.get('backtest_update_start_date', None)
 
     archive_model_param_config(model_name=model.name, settings=model.settings)
     archive_strategy_signals(model=model, signal_data=signal_data)
@@ -310,12 +368,14 @@ def archive_portfolio_strategy_signal_pnl(model=None, signal_data=None, **kwargs
         signal_data_s = pd.DataFrame(signal_data[signal])
 
         portfolio_summary_df = model.compute_signal_backtests(
-            signal_data=signal_data_s, signal_name=signal)
+            signal_data=signal_data_s,
+            signal_name=signal,
+            backtest_update_start_date=backtest_update_start_date)
 
         portfolio_summary_df.index.names = ['signal_name', 'date']
 
-        signal_pnl = pd.DataFrame(portfolio_summary_df['total_pnl']) \
-            .rename(columns={'total_pnl': 'pnl'}).unstack('signal_name')
+        signal_pnl = pd.DataFrame(portfolio_summary_df['pnl_gross']) \
+            .rename(columns={'pnl_gross': 'pnl'}).unstack('signal_name')
 
         archive_strategy_signal_pnl(model=model, signal_pnl=signal_pnl)
 
@@ -367,8 +427,100 @@ def get_portfolio_strategy_security_master(model=None):
 
 def archive_portfolio_strategy_positions(model=None, positions=None):
 
-    positions_archive = model.process_positions_for_archive(positions=positions)
+    model_id = get_model_id(model_name=model.name)
+    model_param_id = get_model_param_config_id(model_name=model.name,
+                                               settings=model.settings)
+    db_sec_master = get_portfolio_strategy_security_master(model=model)
+
+    positions_archive = model.process_positions_for_archive(
+        positions=positions,
+        db_sec_master=db_sec_master,
+        model_id=model_id,
+        model_param_id=model_param_id
+    )
     table = db.get_table('model_portfolio_outputs')
     db.execute_db_save(df=positions_archive, table=table, time_series=True)
 
 
+def compute_and_archive_standard_strategy_backtest(sm=None,
+                                                   strategy_name=None):
+
+    model = sm.strategies[strategy_name]
+    signal_data = sm.outputs[strategy_name]['signal_data']
+    signal_data_z = sm.outputs[strategy_name]['signal_data_z']
+    signal_pnl = sm.outputs[strategy_name]['signal_pnl']
+
+    # These need to be done
+    archive_model_param_config(model_name=model.name,
+                               settings=model.settings)
+    archive_strategy_signals(model=model,
+                             signal_data=signal_data)
+
+    # This is the signals and Z-scores, at the signal/strategy level
+    archive_strategy_signal_data(model=model,
+                                 signal_data=signal_data,
+                                 signal_data_z=signal_data_z)
+
+    # This is the signal PNL, at the signal/strategy level
+    archive_strategy_signal_pnl(model=model,
+                                signal_pnl=signal_pnl)
+
+    # This is the final PNL, at the strategy level
+    archive_model_outputs(model=model,
+                          outputs=sm.outputs[strategy_name])
+
+def compute_and_archive_portfolio_strategy_backtest(sm=None,
+                                                    strategy_name=None,
+                                                    included_signals=None,
+                                                    start_date=dt.datetime(1990,1,1)):
+    model = sm.strategies[strategy_name]
+    signal_data = sm.outputs[strategy_name]['signal_data']
+    signal_data_z = sm.outputs[strategy_name]['signal_data_z']
+
+    # These need to be done
+    archive_model_param_config(model_name=model.name,
+                               settings=model.settings)
+    archive_strategy_signals(model=model,
+                             signal_data=signal_data)
+
+    # This is the signal PNL, at the signal/strategy level
+    compute_and_archive_portfolio_strategy_signal_pnl(
+        model=model,
+        signal_data=signal_data,
+        backtest_update_start_date=start_date)
+
+    # This is the signals and Z-scores, at the signal/underlying level
+    archive_portfolio_strategy_signal_data(
+        model=model,
+        signal_data=signal_data,
+        signal_data_z=signal_data_z,
+        backtest_update_start_date=start_date)
+
+    # Retrieve signal PNL
+    signal_pnl = get_strategy_signal_data(model=model,
+                                          ref_entity_ids=['strategy',
+                                                             't'])
+    signal_pnl = signal_pnl[['date', 'signal_name', 'pnl']] \
+        .sort_values(['signal_name', 'date']) \
+        .set_index(['date', 'signal_name'])['pnl'] \
+        .unstack('signal_name')
+
+    # Run the optimization and the final backtest
+    positions, portfolio_summary, sec_master, optim_output = \
+        model.compute_master_backtest(
+            signal_pnl=signal_pnl,
+            signal_data=signal_data,
+            included_signals=included_signals,
+            backtest_update_start_date=start_date
+        )
+
+    # Archive the portfolio summary (strategy-level PNL)
+    archive_model_outputs(model=model, outputs=portfolio_summary)
+
+    # Archive the security master
+    archive_portfolio_strategy_security_master(model=model,
+                                               sec_master=sec_master)
+
+    # Archive the positions
+    archive_portfolio_strategy_positions(model=model,
+                                         positions=positions)

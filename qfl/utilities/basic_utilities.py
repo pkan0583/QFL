@@ -5,6 +5,7 @@ Created on Sun Jan 03 13:02:07 2016
 import datetime as dt
 import pandas as pd
 import numpy as np
+import json
 from workalendar.europe import EuropeanCentralBank, Germany, UnitedKingdom, \
     France, Sweden, Switzerland, Spain, Italy
 from workalendar.america import Brazil, Mexico, Chile
@@ -47,9 +48,61 @@ def is_iterable(x=None):
         return True
 
 
+def is_date_type(x=None):
+
+    if isinstance(x, dt.datetime) or isinstance(x, dt.date) \
+            or isinstance(x, pd.Timestamp) or isinstance(x, np.datetime64):
+        return True
+    else:
+        return False
+
+
 def replace_nan_with_none(df=None):
     df = df.where((pd.notnull(df)), None)
     return df
+
+
+def json_column_from_columns(df=None, columns=None, new_col_name=None):
+
+    df = df.copy(deep=True)
+    for column in df.columns:
+        if is_date_type(df[column].values[0]):
+            df[column] = df[column].astype('str')
+
+    tmp = df[columns].to_dict(orient='records')
+    tmp = [json.dumps(k) for k in tmp]
+    df[new_col_name] = tmp
+
+    for col in columns:
+        del df[col]
+
+    return df
+
+
+def df_columns_from_json_column(df=None, json_col_name=None):
+
+    df = df.copy(deep=True)
+    new_cols = [json.loads(d) for d in df[json_col_name].values]
+    new_cols = pd.DataFrame.from_dict(new_cols)
+    new_cols.index = df.index
+    df[new_cols.columns] = new_cols
+    del df[json_col_name]
+
+    return df
+
+
+def numeric_cap_floor(x=None, cap=None, floor=None):
+
+    if isinstance(x, pd.Series):
+        x = x.clip(upper=cap, lower=floor)
+    elif isinstance(x, np.ndarray):
+        x = x.clip(min=floor, max=cap)
+    else:
+        if cap is not None:
+            x = min(x, cap)
+        if floor is not None:
+            x = max(x, floor)
+    return x
 
 """
 -------------------------------------------------------------------------------
@@ -201,7 +254,9 @@ class DateUtils(object):
                     end_date=None,
                     calendar_name=default_calendar):
 
-        if isinstance(start_date, pd.Series) and isinstance(end_date, pd.Series):
+        if (isinstance(start_date, pd.Series) and isinstance(end_date, pd.Series))\
+                or (isinstance(start_date, pd.tseries.index.DatetimeIndex)
+                and isinstance(end_date, pd.tseries.index.DatetimeIndex)):
             hol = cls.get_holidays(calendar_name).keys()
             A = [d.date() for d in start_date]
             B = [d.date() for d in end_date]

@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import xmltodict
 import simplejson as json
+from scipy.stats import norm
 
 import qfl.core.market_data as md
 import qfl.core.portfolio_utils as putils
@@ -21,6 +22,8 @@ reload(qfl_data)
 from qfl.etl.data_interfaces import NutmegAdapter
 
 db.initialize()
+
+
 
 
 '''

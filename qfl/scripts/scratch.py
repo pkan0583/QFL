@@ -34,7 +34,230 @@ import qfl.models.volatility_factor_model as vfm
 from qfl.utilities.statistics import RollingFactorModel
 from qfl.models.volatility_factor_model import VolatilityFactorModel
 
+from scipy.interpolate import interp1d
+
 db.initialize()
+
+
+etl.DailyGenericFuturesPriceIngest.ingest_data(start_date=dt.datetime(2016, 7, 1))
+
+import qfl.utilities.bayesian_modeling as bayes
+reload(bayes)
+from qfl.utilities.bayesian_modeling import BayesianTimeSeriesDataCleaner
+
+
+
+# strategy performance analysis
+from qfl.strategies.strategy_master import StrategyMaster
+sm = StrategyMaster()
+
+# VIX strategies
+sm.initialize_vix_curve(price_field='settle_price')
+sm.initialize_equity_vs_vol()
+
+pnl = sm.outputs['vix_curve']['pnl_net']
+
+
+
+
+'''
+--------------------------------------------------------------------------------
+Volatility hedging research
+--------------------------------------------------------------------------------
+'''
+
+start_date = dt.datetime(2010, 1, 1)
+ivol_tenors = [5, 21, 42, 63, 126, 252]
+return_windows = [1, 5, 10, 21, 63]
+ticker = 'ES'
+
+ivol = md.get_futures_ivol_by_series(futures_series='ES',
+                                     maturity_type='constant_maturity',
+                                     start_date=start_date,
+                                     option_type='put')\
+                                     .set_index('date')
+
+underlying_price = md.get_equity_index_prices(
+    tickers=['SPX'],
+    start_date=start_date)\
+    ['last_price']\
+    .reset_index(level='ticker', drop=True)
+
+# ok. we need to fix some strikes initially
+# and then get some vols for those strikes later after spot prices move
+underlying_price.index = pd.DataFrame(
+    underlying_price.index.get_level_values('date'))['date'].dt.date
+
+df = pd.DataFrame(index=underlying_price.index,
+                  columns=['returns', 'ivol_chg'])
+regressions = dict()
+betas = pd.DataFrame(index=ivol_tenors, columns=return_windows)
+stderrs = pd.DataFrame(index=ivol_tenors, columns=return_windows)
+rsquares = pd.DataFrame(index=ivol_tenors, columns=return_windows)
+tstats = pd.DataFrame(index=ivol_tenors, columns=return_windows)
+
+delta_grid = np.append([0.01],
+                       np.append(np.arange(0.05, 1.0, 0.05),
+                                 [0.99]))
+data_dict = dict()
+
+for t1 in ivol_tenors:
+
+    regressions[t1] = dict()
+    data_dict[t1] = dict()
+    ivol_t = ivol[ivol['days_to_maturity'] == t1]
+    del ivol_t['series_id']
+    del ivol_t['days_to_maturity']
+    del ivol_t['option_type']
+
+    for t2 in return_windows:
+
+        if t2 <= t1:
+
+            # Grid of moneyness for the delta points that we have
+            moneyness_by_delta = calcs.black_scholes_moneyness_from_delta(
+                call_delta=delta_grid,
+                tenor_in_days=t1,
+                ivol=ivol_t,
+                risk_free=0.0,
+                div_yield=0.02)
+
+            data = pd.DataFrame(index=underlying_price.index,
+                                columns=['strike', 'strike_vol_0', 'strike_vol_t'],
+                                data=underlying_price)
+
+            # Here we're going to get the fixed-strike implied vols
+            data['spot_0'] = underlying_price
+            data['strike'] = underlying_price * moneyness_by_delta.loc[date,
+                                                                       'ivol_50d']
+            data['spot_t'] = underlying_price.shift(-t2)
+            data['return_t'] = underlying_price.shift(-t2) / underlying_price - 1
+            data['strike_money_t'] = data['strike'] / data['spot_t']
+            data['strike_vol_0'] = ivol_t['ivol_50d']
+
+            dates = data.index.get_level_values('date')
+            for t in range(0, len(dates)-t2):
+
+                date = dates[t]
+                t_date = dates[t + t2]
+                if t_date in ivol_t.index and date in ivol_t.index:
+                    interpolant = interp1d(x=moneyness_by_delta.loc[t_date],
+                                           y=ivol_t.loc[t_date],
+                                           bounds_error=False)
+                    data.loc[date, 'strike_vol_t'] = interpolant(
+                        data.loc[date, 'strike_money_t'])
+
+            for col in data.columns:
+                data[col] = data[col].fillna(method='ffill', limit=2)
+                data[col] = data[col].astype(float)
+            data = data[np.isfinite(data[data.columns]).all(axis=1)]
+
+            # neglecting rolldown
+            data['p_0'] = calcs.black_scholes_price(spot=data['spot_0'],
+                                                    strike=data['strike'],
+                                                    tenor_in_days=t1,
+                                                    risk_free=0.0,
+                                                    div_amt=0.0,
+                                                    option_type='p',
+                                                    ivol=data['strike_vol_0']) \
+                          + calcs.black_scholes_price(spot=data['spot_0'],
+                                                      strike=data['strike'],
+                                                      tenor_in_days=t1,
+                                                      risk_free=0.0,
+                                                      div_amt=0.0,
+                                                      option_type='c',
+                                                      ivol=data['strike_vol_0'])
+            data['p_t'] = calcs.black_scholes_price(spot=data['spot_t'],
+                                                    strike=data['strike'],
+                                                    tenor_in_days=t1 - t2,
+                                                    risk_free=0.0,
+                                                    div_amt=0.0,
+                                                    option_type='p',
+                                                    ivol=data['strike_vol_t']) \
+                          + calcs.black_scholes_price(spot=data['spot_t'],
+                                                      strike=data['strike'],
+                                                      tenor_in_days=t1 - t2,
+                                                      risk_free=0.0,
+                                                      div_amt=0.0,
+                                                      option_type='c',
+                                                      ivol=data['strike_vol_t'])
+            data['pnl'] = data['p_t'] - data['p_0']
+            data['pnl_pct'] = data['pnl'] / data['strike']
+
+            df['returns'] = underlying_price / underlying_price.shift(t2) - 1
+            df['ivol_chg'] = ivol_t['ivol_50d'] - ivol_t['ivol_50d'].shift(t2)
+            df['pnl_pct'] = data['pnl_pct']
+
+            regressions[t1][t2] = pd.ols(y=df['pnl_pct'], x=df['returns'])
+            betas.loc[t1, t2] = regressions[t1][t2].beta[0]
+            stderrs.loc[t1, t2] = regressions[t1][t2].resid.std()
+            tstats.loc[t1, t2] = regressions[t1][t2].t_stat[0]
+            rsquares.loc[t1, t2] = regressions[t1][t2].r2
+
+            data_dict[t1][t2] = data
+
+t1 = 21
+# fig, ax = plt.subplots(len(data_dict[t1]), 1)
+fig, ax = plt.subplots()
+counter = 0
+d = [k for k in return_windows if k <= t1]
+colors = ['k', 'b', 'g', 'r', 'y', 'o']
+for t2 in d:
+    ax.scatter(x=data_dict[t1][t2]['return_t'],
+               y=data_dict[t1][t2]['pnl_pct'],
+               color=colors[counter],
+               s=10)
+    # ax.set_title(str(t1) + '-day straddle PNL after ' + str(t2) + ' days, function of spot move')
+    # ax.set_xlabel('underlying return')
+    # ax.set_ylabel('straddle pnl, % of notional')
+    counter += 1
+ax.legend(d)
+ax.set_xlabel('underlying return over period')
+ax.set_ylabel('straddle PNL, % of notional, over period')
+ax.set_title(str(t1) + '-day straddle PNL after a variable number of days, as function of spot move')
+
+
+return_grid = np.arange(-0.15, 0.10, 0.01)
+bandwidth = 0.0025
+mean_pnl_grid = pd.DataFrame()
+counter = 0
+for r in return_grid:
+    for t1 in ivol_tenors:
+        d = [k for k in return_windows if k <= t1]
+        for t2 in d:
+            ind = data_dict[t1][t2].index[
+                np.abs(data_dict[t1][t2]['return_t'] - r) < bandwidth]
+            if len(ind) > 0:
+                mean_pnl_grid.loc[counter, 'return'] = np.round(r, 2)
+                mean_pnl_grid.loc[counter, 'tenor'] = t1
+                mean_pnl_grid.loc[counter, 'return_period'] = t2
+                mean_pnl_grid.loc[counter, 'pnl_pct'] = \
+                    data_dict[t1][t2].loc[ind, 'pnl_pct'].mean()
+            counter += 1
+mean_pnl_grid = mean_pnl_grid.sort_values(['tenor', 'return_period'])\
+                .set_index(['return', 'tenor', 'return_period'])
+
+mean_pnl_grid.unstack(level='return').to_excel('qfl\data\sp_convexity.xlsx')
+
+
+
+'''
+--------------------------------------------------------------------------------
+Plotting volatility
+--------------------------------------------------------------------------------
+'''
+
+ids = db.get_equity_ids(equity_tickers=md.get_etf_vol_universe())
+etl.ingest_historical_equity_prices(ids=ids, start_date=dt.datetime(1990, 1, 1))
+
+xlf = md.get_equity_prices(tickers=['XLB'], start_date = dt.datetime(2010, 1, 1))
+xlf = xlf.reset_index(level='ticker', drop=True)
+xlf['returns'] = xlf['adj_close'] / xlf['adj_close'].shift(1)
+xlf['rv_63'] = xlf['returns'].rolling(window=63).std() * np.sqrt(252)
+
+plt.plot(xlf['adj_close'])
+
+
 
 '''
 --------------------------------------------------------------------------------
@@ -285,28 +508,6 @@ plt.legend(factor_names)
 plt.plot(factor_data_composite.iloc[63:].ewm(com=63).std())
 plt.legend(factor_names)
 
-
-'''
---------------------------------------------------------------------------------
-Volatility data cleaning
---------------------------------------------------------------------------------
-'''
-
-# testing data cleaning
-start_date = dt.datetime(2010, 1, 1)
-vsm = VolatilitySurfaceManager()
-vsm.load_data(tickers=['SPY', 'EEM'], start_date=start_date)
-iv = vsm.get_data(tickers=['SPY', 'EEM'],
-                  start_date=start_date,
-                  fields=['iv_3m'])['iv_3m'].unstack('ticker')
-sp = md.get_equity_prices(tickers=['EEM'],
-                          start_date=start_date,
-                          price_field='adj_close')['adj_close'].unstack('ticker')
-
-tmp = calcs.clean_implied_vol_data(tickers=['SPY', 'EEM'],
-                                   ivol=iv,
-                                   stock_prices=sp,
-                                   ref_ivol_ticker='SPY')
 
 '''
 --------------------------------------------------------------------------------

@@ -823,16 +823,104 @@ class DatabaseInterface(object):
         )
         cls.tables['yfinance_metadata'] = yfinance_metadata_table
 
+        # MODELS
+        models_table = sa.Table(
+            'models', cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('model_name', sa.String, nullable=False),
+            sa.Column('ref_object_type', sa.String, nullable=False)
+        )
+        cls.tables['models'] = models_table
+
+        # MODEL PARAMETER CONFIG
+        model_param_config_table = sa.Table(
+            'model_param_config', cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('model_id', sa.Integer, nullable=False),
+            sa.Column('model_params', JSON, nullable=False),
+            sa.ForeignKeyConstraint(['model_id'], ['models.id']),
+        )
+        cls.tables['model_param_config'] = model_param_config_table
+
+        # MODEL OUTPUT CONFIG
+        model_output_config_table = sa.Table(
+            'model_output_config', cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('model_id', sa.Integer, nullable=False),
+            sa.Column('output_name', sa.String, nullable=False),
+            sa.ForeignKeyConstraint(['model_id'], ['models.id'])
+        )
+        cls.tables['model_output_config'] = model_output_config_table
+
         # MODEL OUTPUTS
         model_outputs_table = sa.Table(
             'model_outputs', cls.metadata,
-            sa.Column('model', sa.String(64), primary_key=True),
-            sa.Column('output_id', sa.String(64), primary_key=True),
-            sa.Column('model_config', JSONB, primary_key=True),
+            sa.Column('model_id', sa.Integer, primary_key=True),
+            sa.Column('model_param_id', sa.Integer, primary_key=True),
+            sa.Column('model_output_id', sa.Integer, primary_key=True),
             sa.Column('date', sa.Date, primary_key=True),
-            sa.Column('value', sa.Float)
+            sa.Column('value', sa.Float),
+            sa.ForeignKeyConstraint(['model_id'], ['models.id']),
+            sa.ForeignKeyConstraint(['model_param_id'], ['model_param_config.id']),
+            sa.ForeignKeyConstraint(['model_output_id'], ['model_output_config.id'])
         )
         cls.tables['model_outputs'] = model_outputs_table
+
+        # MODEL PORTFOLIO SECURITY MASTER
+        model_portfolio_sec_master_table = sa.Table(
+            'model_portfolio_sec_master', cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('model_id', sa.Integer, nullable=False),
+            sa.Column('model_param_id', sa.Integer, nullable=False),
+            sa.Column('instrument_name', sa.String, nullable=False),
+            sa.Column('instrument_type', sa.String, nullable=False),
+            sa.Column('instrument_attributes', JSON, nullable=False)
+        )
+        cls.tables['model_portfolio_sec_master'] \
+            = model_portfolio_sec_master_table
+
+        # MODEL PORTFOLIO OUTPUTS
+        model_portfolio_outputs_table = sa.Table(
+            'model_portfolio_outputs', cls.metadata,
+            sa.Column('model_param_id', sa.Integer, primary_key=True),
+            sa.Column('model_id', sa.Integer, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('instrument_id', sa.Integer, primary_key=True),
+            sa.Column('value', JSON),
+            sa.ForeignKeyConstraint(
+                ['instrument_id'], ['model_portfolio_sec_master.id']),
+            sa.ForeignKeyConstraint(
+                ['model_id'], ['models.id']),
+            sa.ForeignKeyConstraint(
+                ['model_param_id'], ['model_param_config.id']),
+        )
+        cls.tables['model_portfolio_outputs'] = model_portfolio_outputs_table
+
+        # MODEL SIGNALS
+        model_signals_table = sa.Table(
+            'model_signals', cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('model_id', sa.Integer),
+            sa.Column('signal_name', sa.String),
+            sa.Column('description', sa.String),
+            sa.ForeignKeyConstraint(['model_id'], ['models.id'])
+        )
+        cls.tables['model_signals'] = model_signals_table
+
+        # MODEL SIGNAL DATA
+        model_signal_data_table = sa.Table(
+            'model_signal_data', cls.metadata,
+            sa.Column('id', sa.Integer, primary_key=True),
+            sa.Column('model_param_id', sa.Integer, primary_key=True),
+            sa.Column('ref_entity_id', sa.String, primary_key=True),
+            sa.Column('date', sa.Date, primary_key=True),
+            sa.Column('value', sa.Float),
+            sa.Column('value_z', sa.Float),
+            sa.Column('pnl', sa.Float),
+            sa.ForeignKeyConstraint(['id'], ['model_signals.id']),
+            sa.ForeignKeyConstraint(['model_param_id'], ['model_param_config.id'])
+        )
+        cls.tables['model_signal_data'] = model_signal_data_table
 
     @classmethod
     def create_tables(cls):
@@ -864,7 +952,6 @@ class DatabaseInterface(object):
             result = cls.engine.execute(sa.insert(table=table,
                                                   values=list_to_write))
         return result
-
 
     @classmethod
     def execute_db_save(cls,

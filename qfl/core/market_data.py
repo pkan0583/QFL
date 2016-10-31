@@ -200,7 +200,6 @@ def get_etf_vol_universe():
                  'EWW',
                  'EWY',
                  'EWZ',
-                 'EZU',
                  'FXI',
                  'GDX',
                  'GLD',
@@ -208,12 +207,9 @@ def get_etf_vol_universe():
                  'HYG',
                  'IBB',
                  'IEF',
-                 'IVV',
-                 'IWF',
                  'IWM',
                  'IYR',
                  'JNK',
-                 'JNUG',
                  'KBE',
                  'KRE',
                  'LQD',
@@ -227,7 +223,6 @@ def get_etf_vol_universe():
                  'TIP',
                  'TLT',
                  'TQQQ',
-                 'TZA',
                  'USO',
                  'VGK',
                  'VWO',
@@ -678,7 +673,7 @@ VOLATILITY SURFACE MANAGER
 
 class RealizedVolatilityManager(object):
 
-    data=None
+    data = None
 
     def __init__(self):
 
@@ -691,8 +686,10 @@ class RealizedVolatilityManager(object):
 
 class VolatilitySurfaceManager(object):
 
-    data=None
+    data = None
+    data_start_date = history_default_start_date
 
+    # This is ORATS specific
     ivol_fields = [
         'ticker', 'date',
         'iv_1m', 'iv_2m', 'iv_3m',
@@ -730,32 +727,57 @@ class VolatilitySurfaceManager(object):
             self.data[col1] = \
                 utils.calendarday(date=dates, num_days=self.data[col2])
 
-        self.data = self.data.sort_index()
+        self.data = self.data.sort_index().drop_duplicates()
+        self.data = self.get_maturity_dates(tickers=tickers)
 
-    def clean_data(self):
+        # enforced cleaning
+        self.data['curvature'] = utils.numeric_cap_floor(
+            x=self.data['curvature'], cap=1.0)
+        self.data['curvature_inf'] = utils.numeric_cap_floor(
+            x=self.data['curvature_inf'], cap=1.0)
 
-        # # Cleaning implied volatility data
-        # clean_ivol = pd.DataFrame(index=ivol.index, columns=ivol.columns)
-        #
-        # clean_ivol['iv_2m'], normal_tests_2m = calcs.clean_implied_vol_data(
-        #     tickers=tickers,
-        #     stock_prices=stock_prices,
-        #     ivol=ivol['iv_2m'],
-        #     ref_ivol_ticker='SPY',
-        #     deg_f=5,
-        #     res_com=5
-        # )
-        #
-        # clean_ivol['iv_3m'], normal_tests_3m = calcs.clean_implied_vol_data(
-        #     tickers=tickers,
-        #     stock_prices=stock_prices,
-        #     ivol=ivol['iv_3m'],
-        #     ref_ivol_ticker='SPY',
-        #     deg_f=5,
-        #     res_com=5
-        # )
+    def clean_data(self, **kwargs):
 
-        pass
+        # This is very limited right now, only applies to a few fields
+        fields = kwargs.get('fields', ['iv_2m', 'iv_3m'])
+        # default_fields = ['iv_1m', 'iv_2m', 'iv_3m',
+        #                   'iv_1mc', 'iv_2mc', 'iv_3mc', 'iv_4mc']
+
+        clean_data = self.data.copy()
+        tickers = kwargs.get('tickers', None)
+        if tickers is None:
+            tickers = np.unique(self.data.index.get_level_values('ticker'))
+        tickers = [str(ticker) for ticker in tickers]
+        ref_ivol_ticker = kwargs.get('ref_ivol_ticker', 'SPY')
+
+        # We use stock prices to assist with the cleaning
+        # stock_prices = kwargs.get('stock_prices', None)
+        # if stock_prices is None:
+        #     stock_price_start_date = utils.workday(
+        #         date=self.data_start_date,
+        #         num_days=-constants.trading_days_per_year * 2)
+        #     stock_prices = get_equity_prices(
+        #         tickers=tickers,
+        #         start_date=stock_price_start_date)\
+        #         ['adj_close']\
+        #         .unstack(level='ticker')
+
+        for field in fields:
+            clean_data[field], prob_dirty = \
+                calcs.clean_implied_vol_data(
+                    tickers=tickers,
+                    # stock_prices=stock_prices,
+                    ivol=self.data[field],
+                    ref_ivol_ticker=ref_ivol_ticker
+                )
+
+        # Overwrite data with clean data
+        self.data = clean_data
+
+        # Temporary
+        # self.data.to_excel('data/clean_ivol.xlsx')
+
+        return clean_data
 
     def get_data(self,
                  tickers=None,
@@ -776,6 +798,38 @@ class VolatilitySurfaceManager(object):
             data = data[fields]
 
         return data
+
+    def get_maturity_dates(self,
+                           tickers=None,
+                           start_date=history_default_start_date,
+                           end_date=dt.datetime.today(),
+                           contract_range=range(1, 5)):
+
+        data = self.get_data(tickers=tickers,
+                             start_date=start_date,
+                             end_date=end_date)
+
+        cols = ['days_to_maturity_' + str(a) + 'mc' for a in contract_range]
+        new_cols = ['maturity_date_' + str(a) + 'mc' for a in contract_range]
+        df = dict()
+
+        for ticker in tickers:
+
+            tk_data = data[data.index.get_level_values('ticker') == ticker]
+            dates = tk_data.index.get_level_values('date')
+
+            for i in range(0, len(cols)):
+                tk_data[new_cols[i]] = utils.calendarday(
+                    date=dates,
+                    num_days=tk_data[cols[i]])
+
+            df[ticker] = tk_data
+
+        df = pd.concat(df)
+        df = df.reset_index().set_index(['date', 'ticker'])
+        del df['level_0']
+
+        return df
 
     def get_roll_schedule(self,
                           tickers=None,
@@ -823,6 +877,57 @@ class VolatilitySurfaceManager(object):
 
         pass
 
+    def get_fixed_maturity_date_vol_by_strike(
+            self,
+            ticker=None,
+            strikes=None,
+            maturity_dates=None,
+            start_date=history_default_start_date,
+            end_date=dt.datetime.today(),
+            strike_as_moneyness=False,
+            ffill_limit=5):
+
+        strikes = np.unique(strikes)
+        maturity_dates = np.unique(maturity_dates)
+
+        data = self.get_data(tickers=[ticker],
+                             start_date=start_date,
+                             end_date=end_date) \
+                .reset_index(level='ticker', drop=True)
+        contract_range = [1, 2, 3, 4]
+
+        # This is what vols would be if these corresponded to the correct date
+        vols_by_contract = dict()
+        for i in contract_range:
+            vols_by_contract[i] = self.get_fixed_maturity_vol_by_strike(
+                ticker=ticker,
+                strikes=strikes,
+                contract_month_number=i,
+                strike_as_moneyness=strike_as_moneyness,
+                start_date=start_date)
+
+        df_dict = dict()
+        for maturity_date in maturity_dates:
+            tmp_dict = dict()
+            for i in contract_range:
+                col = 'maturity_date_' + str(i) + 'mc'
+                ind = data.index[data[col] == maturity_date]
+                tmp_dict[i] = vols_by_contract[i].loc[ind]
+            df_dict[maturity_date] = pd.concat(tmp_dict)
+            df_dict[maturity_date].index = df_dict[maturity_date] \
+                .index.get_level_values('date')
+        df = pd.concat(df_dict)
+        df.index.names = ['maturity_date', 'date']
+        df['ticker'] = ticker
+        df = df.reset_index().set_index(['ticker', 'maturity_date', 'date'])
+
+        df = df.drop_duplicates().unstack('maturity_date')
+        df.columns.names = ['strike', 'maturity_date']
+
+        df = df.fillna(method='ffill', limit=ffill_limit)
+
+        return df
+
     def get_fixed_maturity_vol_by_strike(
             self,
             ticker=None,
@@ -845,6 +950,10 @@ class VolatilitySurfaceManager(object):
         :return:
         """
 
+        unique_strikes, strike_ind = np.unique(strikes, return_inverse=True)
+        orig_strikes = strikes
+        strikes = unique_strikes
+
         delta_grid = np.append([0.001, 0.01],
                                np.append(np.arange(0.05, 1.0, 0.05),
                                          [0.99, 0.999]))
@@ -853,10 +962,10 @@ class VolatilitySurfaceManager(object):
             fm_data = self.get_data(tickers=[ticker],
                                     start_date=start_date,
                                     end_date=end_date)
-            fm_data = fm_data[['iv_1mc', 'iv_2mc', 'iv_3m', 'iv_4mc',
-                           'days_to_maturity_1mc', 'days_to_maturity_2mc',
-                           'days_to_maturity_3mc', 'days_to_maturity_4mc',
-                           'skew', 'curvature', 'skew_inf', 'curvature_inf']]
+            # fm_data = fm_data[['iv_1mc', 'iv_2mc', 'iv_3m', 'iv_4mc',
+            #                'days_to_maturity_1mc', 'days_to_maturity_2mc',
+            #                'days_to_maturity_3mc', 'days_to_maturity_4mc',
+            #                'skew', 'curvature', 'skew_inf', 'curvature_inf']]
             tenor_string = 'days_to_maturity_' + str(
                 contract_month_number) + 'mc'
             tenor_in_days = fm_data[tenor_string]\
@@ -876,7 +985,7 @@ class VolatilitySurfaceManager(object):
             risk_free=0,
             div_yield=0)
 
-        sp = get_equity_prices(tickers=[ticker], start_date=start_date) \
+        sp = get_equity_prices(tickers=[str(ticker)], start_date=start_date) \
             ['adj_close'] \
             .reset_index(level='ticker', drop=True)
 
@@ -898,20 +1007,19 @@ class VolatilitySurfaceManager(object):
             tmp = interp1d(x=fm_m.loc[date], y=fm_vols.loc[date],
                            bounds_error=False)
             interp_vols.loc[date] = tmp(strike_money.loc[date])
-            # hi_ind = interp_vols.loc[date].index[
-            #     strike_money.iloc[t] < fm_m.loc[date].min()]
-            # lo_ind = interp_vols.loc[date].index[
-            #     strike_money.iloc[t] > fm_m.loc[date].max()]
-            # interp_vols.loc[date, lo_ind] = min_m_vol.loc[date]
-            # interp_vols.loc[date, hi_ind] = max_m_vol.loc[date]
 
         for strike in strikes:
+
             hi_ind = interp_vols[strike].index[
                 strike_money[strike] < fm_m.min(axis=1)]
             lo_ind = interp_vols[strike].index[
                 strike_money[strike] > fm_m.max(axis=1)]
             interp_vols.loc[lo_ind, strike] = min_m_vol.loc[lo_ind]
             interp_vols.loc[hi_ind, strike] = max_m_vol.loc[hi_ind]
+
+        df = pd.DataFrame(index=interp_vols.index, columns=orig_strikes)
+        for i in range(0, len(orig_strikes)):
+            df[orig_strikes[i]] = interp_vols[interp_vols.columns[strike_ind[i]]]
 
         return interp_vols
 

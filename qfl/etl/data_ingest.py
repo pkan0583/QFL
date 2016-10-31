@@ -21,6 +21,7 @@ import qfl.utilities.basic_utilities as utils
 from qfl.core.database_interface import DatabaseInterface as db, \
                                         DatabaseUtilities as dbutils
 from qfl.etl.data_interfaces import YahooApi, QuandlApi, FigiApi, DataScraper
+import qfl.models.model_data_manager as mm
 
 # Default start date for historical data ingests
 default_start_date = dt.datetime(1990, 1, 1)
@@ -1827,6 +1828,9 @@ def precompute_constant_maturity_futures_prices(futures_series=None,
         futures_series=futures_series,
         start_date=start_date)
 
+    if futures_series == 'FVS':
+        x=1
+
     cmfp = calcs.compute_constant_maturity_futures_prices(
         generic_futures_data=generic_futures_data,
         constant_maturities_in_days=constant_maturities_in_days,
@@ -2065,6 +2069,13 @@ def ingest_historical_futures_prices(dataset=None,
     precompute_historical_futures_days_to_maturity(
         futures_series=futures_series,
         start_date=start_date,
+        generic=False
+    )
+
+    # Days to maturity
+    precompute_historical_futures_days_to_maturity(
+        futures_series=futures_series,
+        start_date=start_date,
         generic=True
     )
 
@@ -2274,3 +2285,141 @@ def update_futures_prices_by_series(dataset=None,
         x=1
 
     # TODO: what to do if we find a contract that we don't have in the DB
+
+
+"""
+-------------------------------------------------------------------------------
+STRATEGIES
+-------------------------------------------------------------------------------
+"""
+
+
+def ingest_strategy_backtest_data(start_date=None, **kwargs):
+
+    sm = mm.initialize_strategy_environment(**kwargs)
+
+    _ingest_strategy_backtest_data(sm=sm, start_date=start_date, **kwargs)
+
+
+def _ingest_strategy_backtest_data(sm=None,
+                                   start_date=default_start_date,
+                                   **kwargs):
+
+    # TODO: implement start date for this
+
+    # Primary strategy versions
+    strategy_versions = kwargs.get('strategy_versions',
+                                   sm.get_strategy_versions())
+
+    # Standard strategies
+    standard_strategy_names = strategy_versions['standard'].keys()
+
+    for strategy_name in standard_strategy_names:
+
+        model = sm.strategies[strategy_name]
+
+        for strategy_version in strategy_versions['standard'][strategy_name]:
+
+            print(model.name + ' ' + strategy_version)
+
+            model.settings = strategy_versions['standard']\
+                [strategy_name][strategy_version]
+
+            signal_data = sm.outputs[strategy_name]['signal_data']
+            signal_data_z = sm.outputs[strategy_name]['signal_data_z']
+            signal_pnl = sm.outputs[strategy_name]['signal_pnl']
+
+            # These need to be done
+            mm.archive_model_param_config(model_name=model.name,
+                                          settings=model.settings)
+            mm.archive_strategy_signals(model=model,
+                                        signal_data=signal_data)
+
+            # This is the signals and Z-scores, at the signal/strategy level
+            mm.archive_strategy_signal_data(model=model,
+                                            signal_data=signal_data,
+                                            signal_data_z=signal_data_z)
+
+            # This is the signal PNL, at the signal/strategy level
+            mm.archive_strategy_signal_pnl(model=model,
+                                           signal_pnl=signal_pnl)
+
+            # This is the final PNL, at the strategy level
+            mm.archive_model_outputs(model=model,
+                                     outputs=sm.outputs[strategy_name])
+
+            # TODO: shouldn't I archive the weights somehow?
+            # Maybe do something like monthly rolling weights updates?
+
+    # Portfolio strategies
+    portfolio_strategy_names = strategy_versions['portfolio'].keys()
+
+    for strategy_name in portfolio_strategy_names:
+
+        model = sm.strategies[strategy_name]
+
+        for strategy_version in strategy_versions['portfolio'][strategy_name]:
+
+            model.settings = strategy_versions['portfolio']\
+                [strategy_name][strategy_version]
+
+            signal_data = sm.outputs[strategy_name]['signal_data']
+            signal_data_z = sm.outputs[strategy_name]['signal_data_z']
+
+            # These need to be done
+            mm.archive_model_param_config(model_name=model.name,
+                                          settings=model.settings)
+            mm.archive_strategy_signals(model=model,
+                                        signal_data=signal_data)
+
+            # This is the signal PNL, at the signal/strategy level
+            mm.compute_and_archive_portfolio_strategy_signal_pnl(
+                model=model,
+                signal_data=signal_data,
+                backtest_update_start_date=start_date)
+
+            # This is the signals and Z-scores, at the signal/underlying level
+            mm.archive_portfolio_strategy_signal_data(
+                model=model,
+                signal_data=signal_data,
+                signal_data_z=signal_data_z,
+                backtest_update_start_date=start_date)
+
+            # Retrieve signal PNL
+            signal_pnl = mm.get_strategy_signal_data(model=model,
+                                                     ref_entity_ids=['strategy',
+                                                                     't'])
+            signal_pnl = signal_pnl[['date', 'signal_name', 'pnl']] \
+                .sort_values(['signal_name', 'date']) \
+                .set_index(['date', 'signal_name'])['pnl'] \
+                .unstack('signal_name')
+
+            # We are not going to include all the categories of signals
+            included_signals = ['iv_10', 'iv_21', 'iv_42', 'iv_63', 'iv_126',
+                                'iv_252',
+                                'rv_iv_10', 'rv_iv_21', 'rv_iv_42', 'rv_iv_63',
+                                'rv_iv_126', 'rv_iv_252',
+                                'rv_10', 'rv_21', 'rv_42', 'rv_63', 'rv_126',
+                                'ts_0', 'ts_1', 'ts_5', 'ts_10', 'ts_21']
+
+            # Run the optimization and the final backtest
+            positions, portfolio_summary, sec_master, optim_output = \
+                model.compute_master_backtest(
+                    signal_pnl=signal_pnl,
+                    signal_data=signal_data,
+                    included_signals=included_signals,
+                    backtest_update_start_date=start_date
+                )
+
+            # Archive the portfolio summary (strategy-level PNL)
+            mm.archive_model_outputs(model=model, outputs=portfolio_summary)
+
+            # Archive the security master
+            mm.archive_portfolio_strategy_security_master(model=model,
+                                                          sec_master=sec_master)
+
+            # Archive the positions
+            mm.archive_portfolio_strategy_positions(model=model,
+                                                    positions=positions)
+
+

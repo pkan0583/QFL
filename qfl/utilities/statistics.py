@@ -63,6 +63,93 @@ def npreg(dep_var, ind_var, out_grid, bandwidth, other_weights=None):
     return pred_grid
 
 
+class ExplicitFactorModel(object):
+
+    @staticmethod
+    def build_long_short_factors(component_prices=None,
+                                 long_tickers=None,
+                                 short_tickers=None,
+                                 factor_names=None,
+                                 return_multipliers=None,
+                                 return_window_days=5,
+                                 hedge_vol_neutral=None,
+                                 hedge_vol_com=63):
+
+        """
+        :param component_prices: Pandas DataFrame indexed on date,
+        with columns named for tickers
+        :param long_tickers: list of long tickers
+        :param short_tickers: list of short tickers
+        :param factor_names: list of factor names
+        :return:
+        """
+
+        component_returns = component_prices \
+                            / component_prices.shift(return_window_days) - 1
+
+        component_daily_returns = component_prices \
+                            / component_prices.shift(1) - 1
+
+        component_std = component_returns.ewm(com=hedge_vol_com).std()
+
+        factor_returns = pd.DataFrame(index=component_returns.index,
+                                      columns=factor_names)
+
+        factor_daily_returns = pd.DataFrame(index=component_returns.index,
+                                            columns=factor_names)
+
+        if hedge_vol_neutral is None:
+            hedge_vol_neutral = np.ones(len(factor_names))
+
+        for i in range(0, len(factor_names)):
+
+            hedge_ratio = 1.0
+            if hedge_vol_neutral[i] == 1:
+                hedge_ratio = component_std[short_tickers[i]] \
+                              / component_std[long_tickers[i]]
+
+            factor_returns[factor_names[i]] = component_returns[long_tickers[i]]\
+                - component_returns[short_tickers[i]] / hedge_ratio
+
+            factor_daily_returns[factor_names[i]] = \
+                component_daily_returns[long_tickers[i]]\
+                - component_daily_returns[short_tickers[i]] / hedge_ratio
+
+            if return_multipliers is not None:
+                factor_returns[factor_names[i]] *= return_multipliers[i]
+                factor_daily_returns[factor_names[i]] *= return_multipliers[i]
+
+        return factor_returns, factor_daily_returns
+
+    @staticmethod
+    def compute_exposures(factor_returns=None, target_returns=None):
+
+        """
+
+        :param factor_returns: Pandas DataFrame indexed on date,
+        with columns = factors
+        :param target_returns: a series index on date, or a DataFrame
+        indexed on date with columns for the various time series you want
+        exposure for
+        :return:
+        """
+
+        if isinstance(target_returns, pd.Series):
+            target_returns = pd.DataFrame(target_returns)
+
+        regressions = dict()
+        coefs = pd.DataFrame(index=target_returns.columns,
+                             columns=factor_returns.columns)
+        t_stats = pd.DataFrame(index=target_returns.columns,
+                             columns=factor_returns.columns)
+        for col in target_returns.columns:
+            regressions[col] = pd.ols(y=target_returns[col], x=factor_returns)
+            coefs.loc[col] = regressions[col].beta
+            t_stats.loc[col] = regressions[col].t_stat
+
+        return coefs, t_stats, regressions
+
+
 class RollingFactorModel(object):
 
     @classmethod
@@ -170,3 +257,5 @@ class RollingFactorModel(object):
         factor_data_oos = factor_data_oos.sort_index()
 
         return factor_weights_composite, factor_data_composite, factor_data_oos
+
+

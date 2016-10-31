@@ -31,10 +31,11 @@ class FundamentalMacroModel(object):
         diff_threshold = 0.875
 
         if cls.settings is None:
-            macro_data, settings, raw_macro_data = cls.load_fundamental_data()
+            macro_data, settings, raw_macro_data = cls.load_fundamental_data(
+                start_date=start_date)
         else:
             settings = cls.settings
-            macro_data = cls.data.macro_data
+            macro_data = cls.data['macro_data']
             raw_macro_data = cls.raw_data
 
         macro_data, macro_data_1d, macro_data_3d, macro_data_6d, macro_data_ma = \
@@ -78,13 +79,13 @@ class FundamentalMacroModel(object):
             components=components_ma, pca_factors=pca_factors_ma,
             settings=settings)
 
-        cls.calc = struct
-        cls.calc.macro_data_stationary = macro_data_stationary
-        cls.calc.ar1_coefs = ar1_coefs
-        cls.calc.components = components
-        cls.calc.pca_factors = pca_factors
-        cls.calc.components_ma = components_ma
-        cls.calc.pca_factors_ma = pca_factors_ma
+        cls.calc = dict()
+        cls.calc['macro_data_stationary'] = macro_data_stationary
+        cls.calc['ar1_coefs'] = ar1_coefs
+        cls.calc['components'] = components
+        cls.calc['pca_factors'] = pca_factors
+        cls.calc['components_ma'] = components_ma
+        cls.calc['pca_factors_ma'] = pca_factors_ma
 
         return cls.calc
 
@@ -95,31 +96,31 @@ class FundamentalMacroModel(object):
             start_date = cls.default_start_date
 
         # Settings
-        settings = struct
-        settings.start_date = start_date
-        settings.config_filename = 'qfl/macro/macro_model_cfg.csv'
-        settings.gdp_fieldname = 'GDP'
-        settings.cpi_fieldname = 'CPILFESL'
-        settings.pop_fieldname = 'POP'
+        settings = dict()
+        settings['start_date'] = start_date
+        settings['config_filename'] = 'qfl/macro/macro_model_cfg.csv'
+        settings['gdp_fieldname'] = 'GDP'
+        settings['cpi_fieldname'] = 'CPILFESL'
+        settings['pop_fieldname'] = 'POP'
 
         # Read configuration
-        settings.config_table = pd.read_csv(settings.config_filename)
+        settings['config_table'] = pd.read_csv(settings['config_filename'])
 
         # Active filter
-        settings.config_table = settings.config_table[
-            settings.config_table['ACTIVE'] == 1]
+        settings['config_table'] = settings['config_table'][
+            settings['config_table']['ACTIVE'] == 1]
 
         # Fields and field names
-        settings.data_fields = settings.config_table['FRED_CODE'].tolist()
-        settings.data_fieldnames = settings.config_table['SERIES_NAME'].tolist()
-        settings.use_log = settings.config_table['USE_LOG'].tolist()
-        settings.ma_length = settings.config_table['MA_LENGTH'].tolist()
-        settings.div_gdp = settings.config_table['DIV_GDP'].tolist()
-        settings.div_pop = settings.config_table['DIV_POP'].tolist()
-        settings.div_cpi = settings.config_table['DIV_CPI'].tolist()
+        settings['data_fields'] = settings['config_table']['FRED_CODE'].tolist()
+        settings['data_fieldnames'] = settings['config_table']['SERIES_NAME'].tolist()
+        settings['use_log'] = settings['config_table']['USE_LOG'].tolist()
+        settings['ma_length'] = settings['config_table']['MA_LENGTH'].tolist()
+        settings['div_gdp'] = settings['config_table']['DIV_GDP'].tolist()
+        settings['div_pop'] = settings['config_table']['DIV_POP'].tolist()
+        settings['div_cpi'] = settings['config_table']['DIV_CPI'].tolist()
 
         # Load data
-        raw_macro_data = pdata.get_data_fred(settings.data_fields, start_date)
+        raw_macro_data = pdata.get_data_fred(settings['data_fields'], start_date)
         macro_data = raw_macro_data.copy()
 
         # Get GDP data and fill in divisors
@@ -139,20 +140,20 @@ class FundamentalMacroModel(object):
                                      settings=settings)
 
         # Get series start and end dates
-        settings.series_start_dates = pd.DataFrame(index=settings.data_fields,
+        settings['series_start_dates'] = pd.DataFrame(index=settings['data_fields'],
                                                    columns=['date'])
-        settings.series_end_dates = pd.DataFrame(index=settings.data_fields,
+        settings['series_end_dates'] = pd.DataFrame(index=settings['data_fields'],
                                                  columns=['date'])
-        for data_field in settings.data_fields:
+        for data_field in settings['data_fields']:
             finite_data = macro_data[data_field][np.isfinite(macro_data[data_field])]
-            settings.series_start_dates.loc[data_field] = finite_data.index.min()
-            settings.series_end_dates.loc[data_field] = finite_data.index.max()
-        settings.common_start_date = settings.series_start_dates.values.max()
-        settings.common_end_date = settings.series_end_dates.values.min()
+            settings['series_start_dates'].loc[data_field] = finite_data.index.min()
+            settings['series_end_dates'].loc[data_field] = finite_data.index.max()
+        settings['common_start_date'] = settings['series_start_dates'].values.max()
+        settings['common_end_date'] = settings['series_end_dates'].values.min()
 
         cls.settings = settings
-        cls.data = struct
-        cls.data.macro_data = macro_data
+        cls.data = dict()
+        cls.data['macro_data'] = macro_data
         cls.raw_data = raw_macro_data
 
         return macro_data, settings, raw_macro_data
@@ -160,13 +161,13 @@ class FundamentalMacroModel(object):
     @classmethod
     def _get_gdp_and_process(cls, macro_data=None, settings=None):
 
-        gdp_data = pdata.get_data_fred(settings.gdp_fieldname, settings.start_date)
-        macro_data[settings.gdp_fieldname] = gdp_data
+        gdp_data = pdata.get_data_fred(settings['gdp_fieldname'], settings['start_date'])
+        macro_data[settings['gdp_fieldname']] = gdp_data
 
-        pop_data = pdata.get_data_fred(settings.pop_fieldname, settings.start_date)
-        macro_data[settings.pop_fieldname] = pop_data
+        pop_data = pdata.get_data_fred(settings['pop_fieldname'], settings['start_date'])
+        macro_data[settings['pop_fieldname']] = pop_data
 
-        cols = [settings.gdp_fieldname, settings.pop_fieldname]
+        cols = [settings['gdp_fieldname'], settings['pop_fieldname']]
 
         macro_data[cols] = macro_data[cols].fillna(method='ffill')
         macro_data[cols] = macro_data[cols].fillna(method='bfill')
@@ -179,7 +180,7 @@ class FundamentalMacroModel(object):
         # Filling in retail data: join two series
         if 'RSXFS' in macro_data.columns:
             retail_series_join_date = dt.datetime(1992, 1, 1)
-            other_retail_sales = pdata.get_data_fred('RETAIL', settings.start_date)
+            other_retail_sales = pdata.get_data_fred('RETAIL', settings['start_date'])
             levels_ratio = other_retail_sales['RETAIL'] \
                 [other_retail_sales.index == retail_series_join_date] \
                 / macro_data['RSXFS'][macro_data.index == retail_series_join_date][0]
@@ -194,20 +195,20 @@ class FundamentalMacroModel(object):
     def _add_claims_data(cls, macro_data=None, settings=None):
 
         # Handle claims data
-        claims = pdata.get_data_fred('IC4WSA', settings.start_date)
+        claims = pdata.get_data_fred('IC4WSA', settings['start_date'])
         claims = claims.resample('M').last()
         claims.index = claims.index + pd.tseries.offsets.BDay(1)
         tmp = [dt.datetime(claims.index[t].year, claims.index[t].month, 1)
                for t in range(0, len(claims))]
         claims.index = pd.DatetimeIndex(tmp)
         macro_data['Claims'] = claims
-        settings.data_fields = settings.data_fields + ['Claims']
-        settings.data_fieldnames = settings.data_fieldnames + ['Jobless Claims']
-        settings.use_log += [0]
-        settings.div_gdp += [0]
-        settings.div_pop += [1]
-        settings.div_cpi += [0]
-        settings.ma_length += [12]
+        settings['data_fields'] = settings['data_fields'] + ['Claims']
+        settings['data_fieldnames'] = settings['data_fieldnames'] + ['Jobless Claims']
+        settings['use_log'] += [0]
+        settings['div_gdp'] += [0]
+        settings['div_pop'] += [1]
+        settings['div_cpi'] += [0]
+        settings['ma_length'] += [12]
 
         return macro_data, settings
 
@@ -215,14 +216,14 @@ class FundamentalMacroModel(object):
     def _clean_data(cls, macro_data=None, settings=None):
 
         # manual override
-        if 'UMCSENT' in settings.data_fields:
+        if 'UMCSENT' in settings['data_fields']:
             macro_data['UMCSENT'][macro_data.index == dt.datetime(2015, 8, 1)] = 91.9
             macro_data['UMCSENT'][macro_data.index == dt.datetime(2015, 9, 1)] = 87.2
             macro_data['UMCSENT'][macro_data.index == dt.datetime(2015, 10, 1)] = 90.0
             macro_data['UMCSENT'][macro_data.index == dt.datetime(2015, 11, 1)] = 91.3
             macro_data['UMCSENT'][macro_data.index == dt.datetime(2015, 12, 1)] = 92.6
 
-        if 'DTBTM' in settings.data_fields:
+        if 'DTBTM' in settings['data_fields']:
             tmp = macro_data['DTBTM'][macro_data.index == dt.datetime(2015, 10, 1)]
             macro_data['DTBTM'][macro_data.index == dt.datetime(2015, 11, 1)] = tmp[0]
             macro_data['DTBTM'][macro_data.index == dt.datetime(2015, 12, 1)] \
@@ -237,23 +238,23 @@ class FundamentalMacroModel(object):
                                   settings=None):
 
         # Make adjustments
-        for i in range(0, len(settings.data_fields)):
-            if settings.use_log[i] == 1:
-                macro_data[settings.data_fields[i]] = \
-                    np.log(macro_data[settings.data_fields[i]])
-            if settings.div_gdp[i] == 1:
-                macro_data[settings.data_fields[i]] \
-                    /= macro_data[settings.gdp_fieldname]
-            if settings.div_pop[i] == 1:
-                macro_data[settings.data_fields[i]] /= macro_data[settings.pop_fieldname]
-            if settings.div_cpi[i] == 1:
-                macro_data[settings.data_fields[i]] /= raw_macro_data[settings.cpi_fieldname]
+        for i in range(0, len(settings['data_fields'])):
+            if settings['use_log'][i] == 1:
+                macro_data[settings['data_fields'][i]] = \
+                    np.log(macro_data[settings['data_fields'][i]])
+            if settings['div_gdp'][i] == 1:
+                macro_data[settings['data_fields'][i]] \
+                    /= macro_data[settings['gdp_fieldname']]
+            if settings['div_pop'][i] == 1:
+                macro_data[settings['data_fields'][i]] /= macro_data[settings['pop_fieldname']]
+            if settings['div_cpi'][i] == 1:
+                macro_data[settings['data_fields'][i]] /= raw_macro_data[settings['cpi_fieldname']]
 
         # First difference
         macro_data_1d = macro_data.diff(1)
 
         # Manual data override
-        if 'DTBTM' in settings.data_fields:
+        if 'DTBTM' in settings['data_fields']:
             macro_data_1d['DTBTM'][macro_data_1d.index
                                    == dt.datetime(2010, 12, 1)] \
                 = -0.05
@@ -265,10 +266,10 @@ class FundamentalMacroModel(object):
         # Moving averages (different lookback for each series
         # To roughly harmonize autoregressive tendencies
         macro_data_ma = pd.DataFrame()
-        for i in range(0, len(settings.data_fieldnames)):
-            macro_data_ma[settings.data_fields[i]] = \
-                macro_data_1d[settings.data_fields[i]] \
-                .rolling(window=settings.ma_length[i],
+        for i in range(0, len(settings['data_fieldnames'])):
+            macro_data_ma[settings['data_fields'][i]] = \
+                macro_data_1d[settings['data_fields'][i]] \
+                .rolling(window=settings['ma_length'][i],
                          center=False) \
                 .mean()
 
@@ -285,43 +286,43 @@ class FundamentalMacroModel(object):
                          settings=None):
 
         reg_outputs = dict()
-        ar1_coefs = np.zeros((len(settings.data_fields), 5))
+        ar1_coefs = np.zeros((len(settings['data_fields']), 5))
         predictedData = pd.DataFrame()
         cleanData = macro_data_ma.copy()
-        cleanData = cleanData[cleanData.index > settings.common_start_date]
+        cleanData = cleanData[cleanData.index > settings['common_start_date']]
         days_since_start = (macro_data.index - macro_data.index[0]).days
         days_since_start = pd.DataFrame(days_since_start)
         days_since_start.index = macro_data.index
-        for i in range(0, len(settings.data_fields)):
+        for i in range(0, len(settings['data_fields'])):
 
             # Trend coefficients
-            tmp = pd.ols(y=macro_data[settings.data_fields[i]],
+            tmp = pd.ols(y=macro_data[settings['data_fields'][i]],
                          x=days_since_start[0])
 
-            tmp = pd.ols(y=macro_data[settings.data_fields[i]],
-                         x=macro_data[settings.data_fields[i]].shift(1))
+            tmp = pd.ols(y=macro_data[settings['data_fields'][i]],
+                         x=macro_data[settings['data_fields'][i]].shift(1))
             ar1_coefs[i, 0] = (tmp.beta['x'])
 
-            tmp = pd.ols(y=macro_data_1d[settings.data_fields[i]],
-                         x=macro_data_1d[settings.data_fields[i]].shift(1))
+            tmp = pd.ols(y=macro_data_1d[settings['data_fields'][i]],
+                         x=macro_data_1d[settings['data_fields'][i]].shift(1))
             ar1_coefs[i, 1] = (tmp.beta['x'])
 
-            tmp = pd.ols(y=macro_data_3d[settings.data_fields[i]],
-                         x=macro_data_3d[settings.data_fields[i]].shift(1))
+            tmp = pd.ols(y=macro_data_3d[settings['data_fields'][i]],
+                         x=macro_data_3d[settings['data_fields'][i]].shift(1))
             ar1_coefs[i, 2] = (tmp.beta['x'])
 
-            tmp = pd.ols(y=macro_data_6d[settings.data_fields[i]],
-                         x=macro_data_6d[settings.data_fields[i]].shift(1))
+            tmp = pd.ols(y=macro_data_6d[settings['data_fields'][i]],
+                         x=macro_data_6d[settings['data_fields'][i]].shift(1))
             ar1_coefs[i, 3] = (tmp.beta['x'])
 
-            tmp = pd.ols(y=macro_data_ma[settings.data_fields[i]],
-                         x=macro_data_ma[settings.data_fields[i]].shift(1))
+            tmp = pd.ols(y=macro_data_ma[settings['data_fields'][i]],
+                         x=macro_data_ma[settings['data_fields'][i]].shift(1))
             ar1_coefs[i, 4] = (tmp.beta['x'])
 
         ar1_coefs = pd.DataFrame(data=ar1_coefs,
-                                 index=settings.data_fields,
+                                 index=settings['data_fields'],
                                  columns=['levels', 'd1', 'd3', 'd6', 'dma'])
-        ar1_coefs['ma_length'] = settings.ma_length
+        ar1_coefs['ma_length'] = settings['ma_length']
 
         return ar1_coefs
 
@@ -343,15 +344,15 @@ class FundamentalMacroModel(object):
     def compute_factors(cls, macro_data_z=None, settings=None, num_factors=4):
 
         # Minimum dataset with all observations
-        pca_data = macro_data_z[settings.data_fields].copy(deep=True)
-        for field in settings.data_fields:
+        pca_data = macro_data_z[settings['data_fields']].copy(deep=True)
+        for field in settings['data_fields']:
             pca_data = pca_data[np.isfinite(pca_data[field])]
 
         # Estimate PCA
         princomp = PCA(n_components=num_factors)
         s1 = princomp.fit(pca_data.values).transform(pca_data)
         components = pd.DataFrame(data=princomp.components_.transpose(),
-                                  index=settings.data_fieldnames)
+                                  index=settings['data_fieldnames'])
         pca_factors = pd.DataFrame(data=s1, index=pca_data.index)
 
         return components, pca_factors, princomp
@@ -360,25 +361,25 @@ class FundamentalMacroModel(object):
     def process_factors(cls, components=None, pca_factors=None, settings=None):
 
         # F1 is growth
-        if 'Unemployment Rate' in settings.data_fieldnames:
+        if 'Unemployment Rate' in settings['data_fieldnames']:
             if components.loc['Unemployment Rate', 0] > 0:
                 components[0] = -components[0]
                 pca_factors[0] = -pca_factors[0]
 
         # F2 is inflation/credit
-        if 'Total Consumer Credit' in settings.data_fieldnames:
+        if 'Total Consumer Credit' in settings['data_fieldnames']:
             if components.loc['Total Consumer Credit', 1] < 0:
                 components[1] = -components[1]
                 pca_factors[1] = -pca_factors[1]
 
         # F3 is real estate
-        if 'Total Construction Spending' in settings.data_fieldnames:
+        if 'Total Construction Spending' in settings['data_fieldnames']:
             if components.loc['Total Construction Spending', 2] < 0:
                 components[2] = -components[2]
                 pca_factors[2] = -pca_factors[2]
 
         # F4 is the labor market
-        if 'Unemployment Rate' in settings.data_fieldnames:
+        if 'Unemployment Rate' in settings['data_fieldnames']:
             if components.loc['Unemployment Rate', 3] > 0:
                 components[3] = -components[3]
                 pca_factors[3] = -pca_factors[3]
@@ -670,9 +671,9 @@ def market_pca():
 
 def plot_graph(settings=None, macro_data_z=None, negate_fields=None):
 
-    symbols = np.array(settings.data_fieldnames).T
-    graph_data = macro_data_z[macro_data_z.index > settings.common_start_date
-                             ][settings.data_fields].iloc[2:]
+    symbols = np.array(settings['data_fieldnames']).T
+    graph_data = macro_data_z[macro_data_z.index > settings['common_start_date']
+                             ][settings['data_fields']].iloc[2:]
     if negate_fields is not None:
         graph_data[negate_fields] = -graph_data[negate_fields]
 

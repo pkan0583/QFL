@@ -1,8 +1,7 @@
 import pandas as pd
 import numpy as np
+from collections import OrderedDict
 import datetime as dt
-import struct
-
 import statsmodels.api as sm
 import qfl.core.market_data as md
 import qfl.core.constants as constants
@@ -14,30 +13,33 @@ class Strategy(object):
     def __init__(self, name):
 
         self.name = name
-        self.strat_data = struct
-        self.calc = struct
-        self.settings = struct
+        self.strat_data = dict()
+        self.calc = dict()
+        self.settings = OrderedDict()
         self.name = None
+
+    def get_default_settings(self):
+
+        raise NotImplementedError
 
     def compute_signal_z(self, **kwargs):
 
         signal_data = kwargs.get('signal_data', None)
         expanding = kwargs.get('expanding', True)
         signals_z_cap = kwargs.get('signals_z_cap', 2.0)
-        if not expanding:
-            com = kwargs.get('window', 252)
 
         if expanding:
             signal_data_z = (signal_data
                             - signal_data.expanding().mean()) \
                             / signal_data.expanding().std()
         else:
+            com = kwargs.get('window', 252)
             signal_data_z = (signal_data
                              - signal_data.ewm(com=com).mean()) \
                             / signal_data.ewm(com=com).std()
 
         signal_data_z = signal_data_z.clip(lower=-signals_z_cap,
-                                             upper=signals_z_cap)
+                                           upper=signals_z_cap)
 
         return signal_data_z
 
@@ -121,33 +123,33 @@ class Strategy(object):
         weights = pd.DataFrame(data=weights, index=signal_er.index,
                                columns=['weight'])
 
-        output = struct
-        output.weights = weights
-        output.port_er_sd = port_er_sd
-        output.portfolio_ir_adjusted = portfolio_ir_adjusted
-        output.optim = optim
+        output = dict()
+        output['weights'] = weights
+        output['port_er_sd'] = port_er_sd
+        output['portfolio_ir_adjusted'] = portfolio_ir_adjusted
+        output['optim'] = optim
 
         return output
 
     def compute_master_backtest(self, **kwargs):
 
         # Basic parameters
-        holding_period_days = kwargs.get('holding_period_days', 1)
-        vol_target_com = kwargs.get('vol_target_com', 63)
-        signals_z_cap = kwargs.get('signals_z_cap', 1.0)
-        rolling_beta_com = kwargs.get('signals_z_cap', 126)
-        transaction_cost_per_unit = kwargs.get('transaction_cost_per_unit', 0.05)
+        holding_period_days = self.settings.get('holding_period_days')
+        vol_target_com = self.settings.get('vol_target_com')
+        signals_z_cap = self.settings.get('signals_z_cap')
+        transaction_cost_per_unit = self.settings.get(
+            'transaction_cost_per_unit')
 
         # Signals data and PNL
         signal_output = self.initialize_signals(**kwargs)
 
-        signal_er = signal_output.signal_pnl.mean() \
+        signal_er = signal_output['signal_pnl'].mean() \
                     * constants.trading_days_per_year
 
         # Single in-sample covariance matrix
-        signal_cov = signal_output.signal_pnl.cov()\
+        signal_cov = signal_output['signal_pnl'].cov()\
                      * constants.trading_days_per_year
-        signal_corr = signal_output.signal_pnl.corr()
+        signal_corr = signal_output['signal_pnl'].corr()
 
         # Optimization
         optim_output = self.compute_signal_portfolio_optimization(
@@ -157,52 +159,120 @@ class Strategy(object):
             **kwargs)
 
         # Combined signal
-        combined_signal = pd.DataFrame(index=signal_output.signal_pnl.index,
-                                       columns=['optim_weight', 'equal_weight'])
-        combined_signal[['optim_weight', 'equal_weight']] = 0.0
+        combined_signal = pd.DataFrame(index=signal_output['signal_pnl'].index,
+                                       columns=['weighted'])
+        combined_signal['weighted'] = 0.0
 
-        for signal in optim_output.weights.index:
+        for signal in optim_output['weights'].index:
             sz = self.compute_signal_z(
-                signal_data=signal_output.signal_data[signal],
+                signal_data=signal_output['signal_data'][signal],
                 signals_z_cap=signals_z_cap)
-            combined_signal['optim_weight'] += optim_output.weights \
+            combined_signal['weighted'] += optim_output['weights'] \
                 .loc[signal].values[0] * sz
-            combined_signal['equal_weight'] += \
-                sz * (1.0 / len(optim_output.weights.index))
 
         # Combined pnl
-        combined_pnl = pd.DataFrame(index=signal_output.signal_pnl.index,
-                                    columns=['optim_weight', 'equal_weight'])
+        combined_pnl = pd.DataFrame(index=signal_output['signal_pnl'].index,
+                                    columns=['pnl_gross', 'pnl_net'])
 
-        combined_pnl['optim_weight'], optim_positions = self.backtest_signals(
+        combined_pnl['pnl_gross'], positions = self.backtest_signals(
             holding_period_days=holding_period_days,
-            signal_data=pd.DataFrame(combined_signal['optim_weight']),
+            signal_data=pd.DataFrame(combined_signal['weighted']),
             vol_target_com=vol_target_com,
             signals_z_cap=signals_z_cap)
 
-        combined_pnl['equal_weight'], ew_positions = self.backtest_signals(
-            holding_period_days=holding_period_days,
-            signal_data=pd.DataFrame(combined_signal['equal_weight']),
-            vol_target_com=vol_target_com,
-            signals_z_cap=signals_z_cap)
+        transactions = np.abs(combined_signal['weighted'].diff(1))
 
-        transactions = np.abs(combined_signal.diff(1))
+        combined_pnl['pnl_gross'] = combined_pnl[np.isfinite(
+            pd.to_numeric(combined_pnl['pnl_gross']))]
 
-        combined_pnl_net = combined_pnl - transactions \
-                                          * transaction_cost_per_unit
+        combined_pnl['pnl_net'] = combined_pnl['pnl_gross']\
+            - transactions * transaction_cost_per_unit
 
-        combined_pnl = combined_pnl[np.isfinite(
-            pd.to_numeric(combined_pnl['optim_weight']))]
-
-        output = struct
-        output.combined_pnl_net = combined_pnl_net
-        output.combined_pnl = combined_pnl
-        output.positions = optim_positions
-        output.optim_output = optim_output
-        output.signal_output = signal_output
-        output.strategy_name = self.name
+        output = dict()
+        output['signal_data'] = signal_output['signal_data']
+        output['signal_data_z'] = signal_output['signal_data_z']
+        output['signal_pnl'] = signal_output['signal_pnl']
+        output['static_pnl'] = signal_output['static_pnl']
+        output['pnl_net'] = combined_pnl['pnl_net']
+        output['pnl_gross'] = combined_pnl['pnl_gross']
+        output['positions'] = positions['weighted']
+        output['optim_output'] = optim_output
+        output['strategy_name'] = self.name
+        output['combined_signal'] = combined_signal
 
         return output
+
+    def process_model_outputs(self, outputs=None):
+
+        archive_outputs = dict()
+        archive_outputs['pnl_gross'] = outputs['pnl_gross']
+        archive_outputs['pnl_net'] = outputs['pnl_net']
+        archive_outputs['positions'] = outputs['positions']
+        archive_outputs['pnl_static'] = outputs['static_pnl']['static_pnl']
+
+        df = pd.concat(archive_outputs).reset_index().rename(
+            columns={'level_0': 'output_name',
+                     0: 'value'})
+
+        return df
+
+    def process_signal_pnl_for_archive(self,
+                                       signal_pnl=None,
+                                       db_signals=None,
+                                       model_param_id=None):
+
+        df = pd.DataFrame(columns=['model_param_id', 'pnl'])
+
+        # Signal data is stored unstacked
+        if len(signal_pnl.index.names) == 1:
+            signal_pnl = signal_pnl.stack()
+            signal_pnl.index.names = ['date', 'signal_name']
+        df['pnl'] = signal_pnl
+        df['model_param_id'] = model_param_id
+        df['ref_entity_id'] = 'strategy'
+
+        df = pd.merge(left=db_signals,
+                      right=df.reset_index(),
+                      on='signal_name')
+        df = df[['id',
+                 'model_param_id',
+                 'ref_entity_id',
+                 'date',
+                 'pnl']]
+
+        return df
+
+    def process_signal_data_for_archive(self,
+                                        signal_data=None,
+                                        signal_data_z=None,
+                                        db_signals=None,
+                                        model_param_id=None):
+
+        df = pd.DataFrame(columns=['model_param_id', 'value', 'value_z'])
+
+        # Signal data is stored unstacked
+        if len(signal_data.index.names) == 1:
+            signal_data = signal_data.stack()
+            signal_data.index.names = ['date', 'signal_name']
+        if len(signal_data_z.index.names) == 1:
+            signal_data_z = signal_data_z.stack()
+            signal_data_z.index.names = ['date', 'signal_name']
+        df['value'] = signal_data
+        df['value_z'] = signal_data_z
+        df['model_param_id'] = model_param_id
+        df['ref_entity_id'] = 'strategy'
+
+        df = pd.merge(left=db_signals,
+                      right=df.reset_index(),
+                      on='signal_name')
+        df = df[['id',
+                 'model_param_id',
+                 'ref_entity_id',
+                 'date',
+                 'value',
+                 'value_z']]
+
+        return df
 
 
 class PortfolioStrategy(Strategy):
@@ -273,11 +343,12 @@ class PortfolioStrategy(Strategy):
                                                 .unstack('ticker')
 
             for sig in signal_data.columns:
+
                 # Signal positions as quantiles
                 signal_positions[q][sig][(signal_pctile[sig].shift(1) > q)] = 0
                 signal_positions[q][sig][(signal_pctile[sig].shift(1) < q_)] = 0
                 signal_positions[q][sig][(signal_pctile[sig].shift(1) <= q)
-                                         & (signal_pctile[sig].shift(1) > q_)] = 1
+                                       & (signal_pctile[sig].shift(1) > q_)] = 1
 
                 signal_pnl[q][sig] = signal_positions[q][sig] * data['tot_pnl']
                 signal_pnl[q][sig] = signal_pnl[q][sig].fillna(value=0)
